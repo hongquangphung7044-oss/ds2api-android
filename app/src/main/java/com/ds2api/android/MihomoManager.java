@@ -100,15 +100,11 @@ public final class MihomoManager {
         File providersDir = new File(workDir, "providers");
         providersDir.mkdirs();
 
-        // 解析配置
-        enabled = config.optBoolean("enabled", false);
-        if (!enabled) {
-            LogStore.get().log(TAG, "mihomo 未启用，跳过启动");
-            return;
-        }
+        // 解析配置（只要有订阅地址即可启动，不强制要求 enabled=true）
+        enabled = true;
         String subscriptionUrl = config.optString("subscription_url", "").trim();
         if (subscriptionUrl.isEmpty()) {
-            throw new IllegalStateException("mihomo 已启用但未配置 subscription_url");
+            throw new IllegalStateException("未配置订阅地址");
         }
         int updateInterval = config.optInt("subscription_update_interval", 3600);
         apiPort = config.optInt("api_port", DEFAULT_API_PORT);
