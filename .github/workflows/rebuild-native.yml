@@ -1,0 +1,55 @@
+name: Rebuild Native Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: '上游 ds2api 分支/tag'
+        default: 'master'
+      mihomo_version:
+        description: 'mihomo 版本'
+        default: 'v1.19.29'
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: 设置 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 设置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 设置 Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-35 build-tools;35.0.0'
+
+      - name: 构建 libds2api.so
+        run: ./scripts/build-go.sh ${{ inputs.upstream_ref }}
+
+      - name: 下载 libmihomo.so
+        run: ./scripts/build-mihomo.sh ${{ inputs.mihomo_version }}
+
+      - name: 构建 APK 验证
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: 提交产物到仓库
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/jniLibs/arm64-v8a/ app/src/main/assets/webui/
+          git commit -m "chore: rebuild native binaries (upstream=${{ inputs.upstream_ref }}, mihomo=${{ inputs.mihomo_version }})" || exit 0
+          git push

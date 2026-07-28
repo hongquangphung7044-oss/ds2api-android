@@ -34,5 +34,14 @@
   },
   "auto_delete": {
     "mode": "none"
+  },
+  "mihomo": {
+    "enabled": false,
+    "subscription_url": "",
+    "subscription_update_interval": 3600,
+    "api_port": 9090,
+    "api_secret": "",
+    "socks5_base_port": 7890,
+    "account_bindings": []
   }
 }

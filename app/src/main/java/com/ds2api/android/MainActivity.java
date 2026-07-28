@@ -36,6 +36,8 @@ public class MainActivity extends Activity implements LogStore.Listener {
     private Button startBtn;
     private Button stopBtn;
     private Button openBtn;
+    private Button proxyBtn;
+    private TextView proxyStatusText;
     private TextView logText;
     private ScrollView logScroll;
 
@@ -91,6 +93,24 @@ public class MainActivity extends Activity implements LogStore.Listener {
         btnRow.addView(startBtn, weightLp());
         btnRow.addView(stopBtn, weightLp());
         btnRow.addView(openBtn, weightLp());
+
+        // 代理配置行
+        LinearLayout proxyRow = new LinearLayout(this);
+        proxyRow.setOrientation(LinearLayout.HORIZONTAL);
+        proxyRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams proxyRowLp = new LinearLayout.LayoutParams(-1, -2);
+        proxyRowLp.topMargin = dp(8);
+        root.addView(proxyRow, proxyRowLp);
+
+        proxyBtn = makeButton("代理配置", v ->
+                startActivity(new Intent(this, ProxyConfigActivity.class)));
+        proxyRow.addView(proxyBtn, new LinearLayout.LayoutParams(-2, dp(36)));
+
+        proxyStatusText = new TextView(this);
+        proxyStatusText.setTextSize(12);
+        proxyStatusText.setTextColor(Color.parseColor("#64748B"));
+        proxyStatusText.setPadding(dp(8), 0, 0, 0);
+        proxyRow.addView(proxyStatusText, new LinearLayout.LayoutParams(0, -2, 1f));
 
         // 日志标题 + 复制/清空
         LinearLayout logHead = new LinearLayout(this);
@@ -230,6 +250,20 @@ public class MainActivity extends Activity implements LogStore.Listener {
         }
         startBtn.setEnabled(st == ServerService.State.STOPPED);
         stopBtn.setEnabled(st == ServerService.State.RUNNING);
+
+        // 代理状态
+        if (MihomoManager.isEnabled()) {
+            if (MihomoManager.isRunning()) {
+                proxyStatusText.setText("● mihomo 运行中 · :" + MihomoManager.getApiPort());
+                proxyStatusText.setTextColor(Color.parseColor("#15803D"));
+            } else {
+                proxyStatusText.setText("● mihomo 已启用但未运行");
+                proxyStatusText.setTextColor(Color.parseColor("#B45309"));
+            }
+        } else {
+            proxyStatusText.setText("代理未启用");
+            proxyStatusText.setTextColor(Color.parseColor("#64748B"));
+        }
     }
 
     private String uptime() {

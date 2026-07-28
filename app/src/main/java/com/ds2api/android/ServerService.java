@@ -27,6 +27,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.UUID;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 /**
  * 前台服务：以子进程方式运行打包在 jniLibs 中的 ds2api Go 服务端，
  * 捕获其 stdout/stderr 到 LogStore，供界面实时展示。
@@ -161,6 +164,9 @@ public class ServerService extends Service {
             ensureConfig(configFile);
             File staticDir = new File(filesDir, "static/admin");
             ensureWebUi(staticDir);
+
+            // 启动 mihomo 代理桥（如果已启用），并注入 Proxy 到 config.json
+            startMihomoIfNeeded(configFile);
 
             String binPath = getApplicationInfo().nativeLibraryDir + "/libds2api.so";
             File bin = new File(binPath);
@@ -313,6 +319,8 @@ public class ServerService extends Service {
 
     private void stopInternal(String reason) {
         LogStore.get().log("APP", "========== 停止服务: " + reason + " ==========");
+        // 同时停止 mihomo 代理桥
+        MihomoManager.stop();
         Process p = process;
         if (p != null) {
             p.destroy();
@@ -344,6 +352,112 @@ public class ServerService extends Service {
             copy(in, out);
         }
         LogStore.get().log("APP", "首次运行：已写入默认配置 config.json");
+    }
+
+    /**
+     * 如果 config.json 的 mihomo.enabled 为 true，启动 mihomo 子进程并注入
+     * SOCKS5 Proxy 条目到 config.json，设置各账号的 proxy_id。
+     */
+    private void startMihomoIfNeeded(File configFile) throws Exception {
+        byte[] data = readAll(new java.io.FileInputStream(configFile));
+        JSONObject cfg = new JSONObject(new String(data, StandardCharsets.UTF_8));
+        JSONObject mihomo = cfg.optJSONObject("mihomo");
+        if (mihomo == null || !mihomo.optBoolean("enabled", false)) {
+            LogStore.get().log("APP", "mihomo 代理桥未启用，跳过");
+            return;
+        }
+        String subUrl = mihomo.optString("subscription_url", "").trim();
+        if (subUrl.isEmpty()) {
+            LogStore.get().log("APP", "mihomo 已启用但未配置订阅地址，跳过");
+            return;
+        }
+
+        LogStore.get().log("APP", "========== 启动 mihomo 代理桥 ==========");
+        File mihomoWorkDir = new File(getFilesDir(), "mihomo");
+        MihomoManager.start(this, mihomoWorkDir, mihomo);
+
+        // 等待 mihomo API 就绪
+        if (!MihomoManager.probeReady()) {
+            LogStore.get().log("APP", "警告: mihomo API 未就绪，代理可能不可用");
+        }
+
+        // 注入 Proxy 条目到 config.json
+        injectProxies(cfg, configFile, mihomo);
+    }
+
+    /**
+     * 为每个 mihomo 账号绑定生成 ds2api Proxy 条目，设置 accounts 的 proxy_id，
+     * 写回 config.json。同时移除旧的 mihomo-* 代理条目避免堆积。
+     */
+    private void injectProxies(JSONObject cfg, File configFile, JSONObject mihomo) throws Exception {
+        int socks5Base = mihomo.optInt("socks5_base_port", MihomoManager.DEFAULT_SOCKS5_BASE_PORT);
+        JSONArray bindings = mihomo.optJSONArray("account_bindings");
+        if (bindings == null || bindings.length() == 0) {
+            LogStore.get().log("APP", "无账号节点绑定，跳过 Proxy 注入");
+            return;
+        }
+
+        // 读取现有 proxies 数组（可能不存在）
+        JSONArray proxies = cfg.optJSONArray("proxies");
+        if (proxies == null) proxies = new JSONArray();
+
+        // 移除旧的 mihomo-* 代理（避免重复注入时堆积）
+        JSONArray cleaned = new JSONArray();
+        for (int i = 0; i < proxies.length(); i++) {
+            JSONObject p = proxies.optJSONObject(i);
+            if (p != null) {
+                String id = p.optString("id", "");
+                if (!id.startsWith("mihomo-")) {
+                    cleaned.put(p);
+                }
+            }
+        }
+        proxies = cleaned;
+
+        // 为每个绑定生成 Proxy 条目
+        JSONObject accountProxyMap = new JSONObject();
+        for (int i = 0; i < bindings.length(); i++) {
+            JSONObject b = bindings.optJSONObject(i);
+            if (b == null) continue;
+            String identifier = b.optString("account_identifier", "").trim();
+            if (identifier.isEmpty()) continue;
+            String proxyId = "mihomo-" + i;
+            int port = socks5Base + i;
+
+            JSONObject proxy = new JSONObject();
+            proxy.put("id", proxyId);
+            proxy.put("name", "mihomo-" + identifier);
+            proxy.put("type", "socks5");
+            proxy.put("host", "127.0.0.1");
+            proxy.put("port", port);
+            proxies.put(proxy);
+            accountProxyMap.put(identifier, proxyId);
+            LogStore.get().log("APP", "注入 Proxy: " + proxyId + " → 127.0.0.1:" + port
+                    + " (账号: " + identifier + ")");
+        }
+        cfg.put("proxies", proxies);
+
+        // 设置 accounts 的 proxy_id
+        JSONArray accounts = cfg.optJSONArray("accounts");
+        if (accounts != null) {
+            for (int i = 0; i < accounts.length(); i++) {
+                JSONObject acc = accounts.optJSONObject(i);
+                if (acc == null) continue;
+                String email = acc.optString("email", "").trim();
+                String mobile = acc.optString("mobile", "").trim();
+                String name = acc.optString("name", "").trim();
+                String identifier = !email.isEmpty() ? email : (!mobile.isEmpty() ? mobile : name);
+                if (accountProxyMap.has(identifier)) {
+                    acc.put("proxy_id", accountProxyMap.getString(identifier));
+                }
+            }
+        }
+
+        // 写回 config.json
+        try (FileOutputStream out = new FileOutputStream(configFile)) {
+            out.write(cfg.toString(2).getBytes(StandardCharsets.UTF_8));
+        }
+        LogStore.get().log("APP", "Proxy 注入完成，已写回 config.json");
     }
 
     /** 释放内置 WebUI 静态资源；版本变化时重新释放。 */
@@ -452,6 +566,7 @@ public class ServerService extends Service {
             p.destroy();
             process = null;
         }
+        MihomoManager.stop();
         state = State.STOPPED;
         releaseWakeLock();
         super.onDestroy();

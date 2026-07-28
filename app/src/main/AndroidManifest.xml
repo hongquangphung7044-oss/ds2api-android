@@ -26,6 +26,12 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ProxyConfigActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false"
+            android:label="代理节点配置" />
+
         <service
             android:name=".ServerService"
             android:exported="false"
