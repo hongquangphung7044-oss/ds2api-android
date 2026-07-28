@@ -1,0 +1,457 @@
+package com.ds2api.android;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.ServiceInfo;
+import android.content.res.AssetManager;
+import android.os.Build;
+import android.os.IBinder;
+import android.os.PowerManager;
+import android.system.Os;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+import java.util.UUID;
+
+/**
+ * 前台服务：以子进程方式运行打包在 jniLibs 中的 ds2api Go 服务端，
+ * 捕获其 stdout/stderr 到 LogStore，供界面实时展示。
+ */
+public class ServerService extends Service {
+
+    public static final String ACTION_START = "com.ds2api.android.START";
+    public static final String ACTION_STOP = "com.ds2api.android.STOP";
+
+    public static final int PORT = 5001;
+    private static final String CHANNEL_ID = "ds2api_server";
+    private static final int NOTIF_ID = 1001;
+    private static final String PREFS = "ds2api";
+
+    public enum State {STOPPED, STARTING, RUNNING}
+
+    // 进程级单例状态（与 Activity 同进程，直接静态共享）
+    private static volatile State state = State.STOPPED;
+    private static volatile Process process;
+    private static volatile long startedAt = 0L;
+    private static volatile String lastError = "";
+
+    private PowerManager.WakeLock wakeLock;
+
+    public static State getState() {
+        return state;
+    }
+
+    public static long getStartedAt() {
+        return startedAt;
+    }
+
+    public static String getLastError() {
+        return lastError;
+    }
+
+    public static boolean isRunning() {
+        Process p = process;
+        return state == State.RUNNING && p != null && p.isAlive();
+    }
+
+    public static String adminKey(Context ctx) {
+        SharedPreferences sp = ctx.getSharedPreferences(PREFS, MODE_PRIVATE);
+        String key = sp.getString("admin_key", null);
+        if (key == null || key.trim().isEmpty()) {
+            key = UUID.randomUUID().toString().replace("-", "");
+            sp.edit().putString("admin_key", key).apply();
+        }
+        return key;
+    }
+
+    public static void startServer(Context ctx) {
+        Intent i = new Intent(ctx, ServerService.class);
+        i.setAction(ACTION_START);
+        if (Build.VERSION.SDK_INT >= 26) {
+            ctx.startForegroundService(i);
+        } else {
+            ctx.startService(i);
+        }
+    }
+
+    public static void stopServer(Context ctx) {
+        Intent i = new Intent(ctx, ServerService.class);
+        i.setAction(ACTION_STOP);
+        ctx.startService(i);
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        String action = intent == null ? null : intent.getAction();
+        if (ACTION_STOP.equals(action)) {
+            stopInternal("用户手动停止");
+            return START_NOT_STICKY;
+        }
+        if (ACTION_START.equals(action)) {
+            startForegroundWithNotification();
+            if (isRunning() || state == State.STARTING) {
+                LogStore.get().log("APP", "服务已在运行，忽略重复的启动请求");
+            } else {
+                startInternal();
+            }
+            return START_STICKY;
+        }
+        // 系统回收后重启但进程已不在：直接停掉，避免“假前台”
+        if (!isRunning()) {
+            stopSelf();
+        }
+        return START_STICKY;
+    }
+
+    private void startForegroundWithNotification() {
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (Build.VERSION.SDK_INT >= 26) {
+            nm.createNotificationChannel(new NotificationChannel(
+                    CHANNEL_ID, "DS2API 服务", NotificationManager.IMPORTANCE_LOW));
+        }
+        Intent open = new Intent(this, MainActivity.class);
+        PendingIntent pi = PendingIntent.getActivity(this, 0, open,
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(this, CHANNEL_ID)
+                : new Notification.Builder(this);
+        Notification n = b.setContentTitle("DS2API 服务运行中")
+                .setContentText("本地端口 " + PORT + "，点按返回应用")
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentIntent(pi)
+                .setOngoing(true)
+                .build();
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+        } else {
+            startForeground(NOTIF_ID, n);
+        }
+    }
+
+    private void startInternal() {
+        state = State.STARTING;
+        lastError = "";
+        LogStore.get().log("APP", "========== 正在启动 ds2api 服务 ==========");
+        new Thread(this::doStart, "ds2api-starter").start();
+    }
+
+    private void doStart() {
+        try {
+            File filesDir = getFilesDir();
+            File configFile = new File(filesDir, "config.json");
+            ensureConfig(configFile);
+            File staticDir = new File(filesDir, "static/admin");
+            ensureWebUi(staticDir);
+
+            String binPath = getApplicationInfo().nativeLibraryDir + "/libds2api.so";
+            File bin = new File(binPath);
+            if (!bin.exists()) {
+                throw new IllegalStateException("未找到原生服务端程序: " + binPath
+                        + "（当前 CPU 架构可能不受支持，本应用仅内置 arm64-v8a）");
+            }
+            try {
+                Os.chmod(binPath, 0755);
+            } catch (Throwable t) {
+                LogStore.get().log("APP", "chmod 失败（通常可忽略）: " + t.getMessage());
+            }
+            if (!bin.canExecute()) {
+                // 部分机型不允许直接执行 nativeLibraryDir，复制到私有目录兜底
+                File local = new File(filesDir, "bin/libds2api");
+                local.getParentFile().mkdirs();
+                try (InputStream in = new java.io.FileInputStream(bin);
+                     OutputStream out = new FileOutputStream(local)) {
+                    copy(in, out);
+                }
+                Os.chmod(local.getAbsolutePath(), 0755);
+                binPath = local.getAbsolutePath();
+                LogStore.get().log("APP", "nativeLibraryDir 不可执行，已改用 " + binPath);
+            }
+
+            ProcessBuilder pb = new ProcessBuilder(binPath);
+            pb.directory(filesDir);
+            pb.redirectErrorStream(true);
+            Map<String, String> env = pb.environment();
+            env.put("PORT", String.valueOf(PORT));
+            env.put("LOG_LEVEL", "INFO");
+            env.put("HOME", filesDir.getAbsolutePath());
+            env.put("TMPDIR", getCacheDir().getAbsolutePath());
+            env.put("DS2API_CONFIG_PATH", configFile.getAbsolutePath());
+            env.put("DS2API_STATIC_ADMIN_DIR", staticDir.getAbsolutePath());
+            env.put("DS2API_AUTO_BUILD_WEBUI", "0");
+            env.put("DS2API_ADMIN_KEY", adminKey(this));
+
+            LogStore.get().log("APP", "工作目录: " + filesDir.getAbsolutePath());
+            LogStore.get().log("APP", "配置文件: " + configFile.getAbsolutePath());
+            LogStore.get().log("APP", "监听端口: " + PORT);
+
+            Process p;
+            try {
+                p = pb.start();
+            } catch (java.io.IOException ioe) {
+                // 个别 ROM 禁止直接执行 nativeLibraryDir，复制到私有目录重试
+                String msg = String.valueOf(ioe.getMessage());
+                if (!msg.contains("Permission denied") && !msg.contains("error=13")) {
+                    throw ioe;
+                }
+                LogStore.get().log("APP", "直接执行被拒绝（" + msg + "），复制到私有目录后重试");
+                File local = new File(filesDir, "bin/libds2api");
+                local.getParentFile().mkdirs();
+                try (InputStream in = new java.io.FileInputStream(bin);
+                     OutputStream out = new FileOutputStream(local)) {
+                    copy(in, out);
+                }
+                Os.chmod(local.getAbsolutePath(), 0755);
+                pb.command(local.getAbsolutePath());
+                p = pb.start();
+            }
+            final Process proc = p;
+            process = proc;
+            startedAt = System.currentTimeMillis();
+            state = State.RUNNING;
+            acquireWakeLock();
+            LogStore.get().log("APP", "进程已启动，等待服务就绪...");
+
+            // 日志读取线程
+            Thread reader = new Thread(() -> readOutput(proc), "ds2api-log-reader");
+            reader.setDaemon(true);
+            reader.start();
+
+            // 就绪探测线程
+            Thread probe = new Thread(this::probeReady, "ds2api-ready-probe");
+            probe.setDaemon(true);
+            probe.start();
+
+            // 退出监听线程
+            Thread waiter = new Thread(() -> {
+                int code;
+                try {
+                    code = proc.waitFor();
+                } catch (InterruptedException e) {
+                    code = -1;
+                }
+                LogStore.get().log("APP", "服务进程已退出，exit code = " + code);
+                state = State.STOPPED;
+                process = null;
+                releaseWakeLock();
+                stopForeground(true);
+                stopSelf();
+            }, "ds2api-waiter");
+            waiter.setDaemon(true);
+            waiter.start();
+        } catch (Throwable t) {
+            lastError = String.valueOf(t.getMessage());
+            LogStore.get().log("APP", "启动失败: " + t);
+            state = State.STOPPED;
+            process = null;
+            releaseWakeLock();
+            stopForeground(true);
+            stopSelf();
+        }
+    }
+
+    private void readOutput(Process p) {
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                LogStore.get().raw(line);
+            }
+        } catch (Throwable t) {
+            LogStore.get().log("APP", "日志读取结束: " + t.getMessage());
+        }
+    }
+
+    private void probeReady() {
+        long deadline = System.currentTimeMillis() + 30_000;
+        while (System.currentTimeMillis() < deadline) {
+            if (!isRunning()) {
+                return;
+            }
+            try {
+                HttpURLConnection c = (HttpURLConnection) new URL(
+                        "http://127.0.0.1:" + PORT + "/v1/models").openConnection();
+                c.setConnectTimeout(1500);
+                c.setReadTimeout(1500);
+                int code = c.getResponseCode();
+                c.disconnect();
+                if (code > 0) {
+                    LogStore.get().log("APP", "服务就绪 ✓  管理界面: http://127.0.0.1:" + PORT + "/admin/"
+                            + "  API: http://127.0.0.1:" + PORT + "/v1");
+                    return;
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException ignored) {
+                return;
+            }
+        }
+        LogStore.get().log("APP", "警告: 30 秒内未检测到服务就绪，请检查上方日志排查");
+    }
+
+    private void stopInternal(String reason) {
+        LogStore.get().log("APP", "========== 停止服务: " + reason + " ==========");
+        Process p = process;
+        if (p != null) {
+            p.destroy();
+            new Thread(() -> {
+                try {
+                    Thread.sleep(3000);
+                } catch (InterruptedException ignored) {
+                }
+                try {
+                    p.destroyForcibly();
+                } catch (Throwable ignored) {
+                }
+            }, "ds2api-killer").start();
+        } else {
+            state = State.STOPPED;
+            releaseWakeLock();
+            stopForeground(true);
+            stopSelf();
+        }
+    }
+
+    private void ensureConfig(File configFile) throws Exception {
+        if (configFile.exists()) {
+            LogStore.get().log("APP", "使用已有配置 config.json（可在管理界面修改）");
+            return;
+        }
+        try (InputStream in = getAssets().open("config.default.json");
+             OutputStream out = new FileOutputStream(configFile)) {
+            copy(in, out);
+        }
+        LogStore.get().log("APP", "首次运行：已写入默认配置 config.json");
+    }
+
+    /** 释放内置 WebUI 静态资源；版本变化时重新释放。 */
+    private void ensureWebUi(File staticDir) throws Exception {
+        File stamp = new File(getFilesDir(), ".webui_version");
+        String current = String.valueOf(BuildConfig.VERSION_CODE);
+        if (staticDir.isDirectory() && stamp.isFile()) {
+            String v = new String(readAll(new java.io.FileInputStream(stamp)), StandardCharsets.UTF_8).trim();
+            if (current.equals(v)) {
+                return;
+            }
+        }
+        deleteRecursively(staticDir);
+        staticDir.mkdirs();
+        copyAssetTree(getAssets(), "webui", staticDir);
+        try (FileOutputStream out = new FileOutputStream(stamp)) {
+            out.write(current.getBytes(StandardCharsets.UTF_8));
+        }
+        LogStore.get().log("APP", "已释放内置管理界面资源到 " + staticDir.getAbsolutePath());
+    }
+
+    private static void copyAssetTree(AssetManager am, String assetPath, File outDir) throws Exception {
+        String[] children = am.list(assetPath);
+        if (children == null || children.length == 0) {
+            // 文件
+            File out = new File(outDir, new File(assetPath).getName());
+            try (InputStream in = am.open(assetPath);
+                 OutputStream os = new FileOutputStream(out)) {
+                copy(in, os);
+            }
+            return;
+        }
+        for (String child : children) {
+            File sub = new File(outDir, child);
+            String childPath = assetPath + "/" + child;
+            String[] grand = am.list(childPath);
+            if (grand != null && grand.length > 0) {
+                sub.mkdirs();
+                copyAssetTree(am, childPath, sub);
+            } else {
+                try (InputStream in = am.open(childPath);
+                     OutputStream os = new FileOutputStream(sub)) {
+                    copy(in, os);
+                }
+            }
+        }
+    }
+
+    private static void copy(InputStream in, OutputStream out) throws Exception {
+        byte[] buf = new byte[64 * 1024];
+        int n;
+        while ((n = in.read(buf)) != -1) {
+            out.write(buf, 0, n);
+        }
+    }
+
+    private static byte[] readAll(InputStream in) throws Exception {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        copy(in, bos);
+        in.close();
+        return bos.toByteArray();
+    }
+
+    private static void deleteRecursively(File f) {
+        if (f == null || !f.exists()) {
+            return;
+        }
+        if (f.isDirectory()) {
+            File[] kids = f.listFiles();
+            if (kids != null) {
+                for (File k : kids) {
+                    deleteRecursively(k);
+                }
+            }
+        }
+        //noinspection ResultOfMethodCallIgnored
+        f.delete();
+    }
+
+    private void acquireWakeLock() {
+        try {
+            if (wakeLock == null) {
+                PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ds2api:server");
+                wakeLock.setReferenceCounted(false);
+            }
+            wakeLock.acquire(12 * 60 * 60 * 1000L);
+        } catch (Throwable t) {
+            LogStore.get().log("APP", "WakeLock 获取失败: " + t.getMessage());
+        }
+    }
+
+    private void releaseWakeLock() {
+        try {
+            if (wakeLock != null && wakeLock.isHeld()) {
+                wakeLock.release();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @Override
+    public void onDestroy() {
+        Process p = process;
+        if (p != null) {
+            p.destroy();
+            process = null;
+        }
+        state = State.STOPPED;
+        releaseWakeLock();
+        super.onDestroy();
+    }
+}

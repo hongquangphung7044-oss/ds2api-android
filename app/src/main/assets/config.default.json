@@ -1,0 +1,38 @@
+{
+  "_comment": "DS2API Android 默认配置。请在网页管理界面(/admin/)中添加 DeepSeek 账号与 API Key，保存后会写回此文件。",
+  "_doc": "https://github.com/ouqiting/ds2api",
+  "keys": [],
+  "api_keys": [],
+  "accounts": [],
+  "model_aliases": {},
+  "responses": {
+    "store_ttl_seconds": 900
+  },
+  "current_input_file": {
+    "enabled": false,
+    "min_chars": 0
+  },
+  "thinking_injection": {
+    "enabled": false,
+    "prompt": ""
+  },
+  "expert_prompt_segment": {
+    "enabled": true,
+    "max_chars": 160000
+  },
+  "embeddings": {
+    "provider": "deterministic"
+  },
+  "admin": {
+    "jwt_expire_hours": 24
+  },
+  "runtime": {
+    "account_max_inflight": 2,
+    "account_max_queue": 0,
+    "global_max_inflight": 0,
+    "token_refresh_interval_hours": 6
+  },
+  "auto_delete": {
+    "mode": "none"
+  }
+}

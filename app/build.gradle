@@ -1,0 +1,58 @@
+plugins {
+    id 'com.android.application'
+}
+
+def keystoreFile = rootProject.file('app/keystore/ds2api.keystore')
+
+android {
+    namespace 'com.ds2api.android'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.ds2api.android"
+        minSdk 24
+        targetSdk 35
+        versionCode 1
+        versionName "4.6.1"
+    }
+
+    signingConfigs {
+        release {
+            if (keystoreFile.exists()) {
+                storeFile keystoreFile
+                storePassword 'ds2api123'
+                keyAlias 'ds2api'
+                keyPassword 'ds2api123'
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            shrinkResources false
+            if (keystoreFile.exists()) {
+                signingConfig signingConfigs.release
+            }
+        }
+        debug {
+            applicationIdSuffix null
+        }
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    packagingOptions {
+        jniLibs {
+            // 必须以未压缩方式打包，保证安装时能完整释放到 nativeLibraryDir
+            useLegacyPackaging true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

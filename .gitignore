@@ -1,0 +1,11 @@
+# Gradle / Android
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+.cxx/
+
+# 系统文件
+.DS_Store
