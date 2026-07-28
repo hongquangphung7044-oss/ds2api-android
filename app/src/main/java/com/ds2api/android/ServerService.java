@@ -379,6 +379,11 @@ public class ServerService extends Service {
         // 等待 mihomo API 就绪
         if (!MihomoManager.probeReady()) {
             LogStore.get().log("APP", "警告: mihomo API 未就绪，代理可能不可用");
+        } else {
+            // 等待订阅加载完成（首次拉取需要网络往返）
+            try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+            // 把每个账号的 selector 切换到用户选定的主节点
+            MihomoManager.applyNodeSelection(mihomo);
         }
 
         // 注入 Proxy 条目到 config.json

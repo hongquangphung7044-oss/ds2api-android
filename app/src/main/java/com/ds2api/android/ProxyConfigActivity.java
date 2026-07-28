@@ -3,6 +3,7 @@ package com.ds2api.android;
 import android.app.Activity;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.text.InputType;
 import android.view.Gravity;
@@ -48,9 +49,14 @@ public class ProxyConfigActivity extends Activity {
     private static final String COLOR_TEXT = "#1F2937";
     private static final String COLOR_TEXT_LIGHT = "#475569";
     private static final String COLOR_GREEN = "#15803D";
+    private static final String COLOR_RED = "#DC2626";
     private static final String COLOR_GRAY = "#64748B";
     private static final String COLOR_DIVIDER = "#E5E7EB";
     private static final String COLOR_CARD_BG = "#F8FAFC";
+    private static final String COLOR_PRIMARY = "#2563EB";
+    private static final String COLOR_PRIMARY_DARK = "#1D4ED8";
+    private static final String COLOR_BTN_SECONDARY = "#F1F5F9";
+    private static final String COLOR_BTN_SECONDARY_BORDER = "#CBD5E1";
 
     private EditText subUrlField;
     private CheckBox enabledCheckbox;
@@ -148,7 +154,14 @@ public class ProxyConfigActivity extends Activity {
         subUrlField.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
         subUrlField.setText(mihomoConfig.optString("subscription_url", ""));
         subUrlField.setSingleLine(true);
-        root.addView(subUrlField);
+        subUrlField.setTextSize(14);
+        subUrlField.setTextColor(Color.parseColor(COLOR_TEXT));
+        subUrlField.setHintTextColor(Color.parseColor(COLOR_GRAY));
+        subUrlField.setPadding(dp(12), dp(10), dp(12), dp(10));
+        subUrlField.setBackground(roundedBackground("#FFFFFF", COLOR_DIVIDER, dp(8)));
+        LinearLayout.LayoutParams subLp = new LinearLayout.LayoutParams(-1, -2);
+        subLp.topMargin = dp(4);
+        root.addView(subUrlField, subLp);
 
         // mihomo 状态行
         LinearLayout statusRow = new LinearLayout(this);
@@ -163,10 +176,10 @@ public class ProxyConfigActivity extends Activity {
         statusRow.addView(mihomoStatusLabel, new LinearLayout.LayoutParams(0, -2, 1f));
 
         // 启动/停止 mihomo 按钮
-        startMihomoBtn = makeButton("启动 mihomo", v -> doStartMihomo());
-        stopMihomoBtn = makeButton("停止 mihomo", v -> doStopMihomo());
-        statusRow.addView(startMihomoBtn, new LinearLayout.LayoutParams(-2, dp(36)));
-        statusRow.addView(stopMihomoBtn, new LinearLayout.LayoutParams(-2, dp(36)));
+        startMihomoBtn = makePrimaryButton("启动 mihomo", v -> doStartMihomo());
+        stopMihomoBtn = makeSecondaryButton("停止", v -> doStopMihomo());
+        statusRow.addView(startMihomoBtn, new LinearLayout.LayoutParams(-2, dp(40)));
+        statusRow.addView(stopMihomoBtn, new LinearLayout.LayoutParams(-2, dp(40)));
 
         // 更新订阅 + 节点数
         LinearLayout refreshRow = new LinearLayout(this);
@@ -176,12 +189,12 @@ public class ProxyConfigActivity extends Activity {
         rrLp.topMargin = dp(8);
         root.addView(refreshRow, rrLp);
 
-        refreshBtn = makeButton("更新订阅", v -> doRefresh());
+        refreshBtn = makeSecondaryButton("更新订阅", v -> doRefresh());
         nodeCountLabel = new TextView(this);
         nodeCountLabel.setPadding(dp(12), 0, 0, 0);
         nodeCountLabel.setTextSize(13);
         nodeCountLabel.setTextColor(Color.parseColor(COLOR_TEXT_LIGHT));
-        refreshRow.addView(refreshBtn, new LinearLayout.LayoutParams(-2, dp(36)));
+        refreshRow.addView(refreshBtn, new LinearLayout.LayoutParams(-2, dp(40)));
         refreshRow.addView(nodeCountLabel, new LinearLayout.LayoutParams(0, -2, 1f));
 
         // 分隔线
@@ -220,12 +233,8 @@ public class ProxyConfigActivity extends Activity {
         section.addView(accountListContainer);
         buildAccountBindings();
 
-        // 保存按钮
-        saveBtn = new Button(this);
-        saveBtn.setText("保存配置");
-        saveBtn.setTextSize(13);
-        saveBtn.setAllCaps(false);
-        saveBtn.setOnClickListener(v -> doSave());
+        // 保存按钮（主操作）
+        saveBtn = makePrimaryButton("保存配置", v -> doSave());
         LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(-1, -2);
         saveLp.topMargin = dp(16);
         section.addView(saveBtn, saveLp);
@@ -278,11 +287,11 @@ public class ProxyConfigActivity extends Activity {
     private View buildAccountCard(int accIndex, String identifier, JSONArray existingNodes) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(12), dp(12), dp(12), dp(12));
+        card.setPadding(dp(14), dp(14), dp(14), dp(14));
         LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(-1, -2);
-        cardLp.topMargin = dp(8);
+        cardLp.topMargin = dp(10);
         card.setLayoutParams(cardLp);
-        card.setBackgroundColor(Color.parseColor(COLOR_CARD_BG));
+        card.setBackground(cardBackground());
 
         // 账号标识
         TextView accLabel = new TextView(this);
@@ -313,22 +322,14 @@ public class ProxyConfigActivity extends Activity {
         brLp.topMargin = dp(6);
         btnRow.setLayoutParams(brLp);
 
-        Button addBtn = new Button(this);
-        addBtn.setText("+ 添加备用");
-        addBtn.setTextSize(12);
-        addBtn.setAllCaps(false);
-        addBtn.setOnClickListener(v -> {
+        Button addBtn = makeSecondaryButton("+ 添加备用", v -> {
             int idx = spinners.size();
             card.addView(buildNodeRow(spinners, delayLabels, idx, "", card), card.getChildCount() - 1);
         });
-        btnRow.addView(addBtn, new LinearLayout.LayoutParams(-2, dp(36)));
+        btnRow.addView(addBtn, new LinearLayout.LayoutParams(-2, dp(38)));
 
-        Button testBtn = new Button(this);
-        testBtn.setText("测试延迟");
-        testBtn.setTextSize(12);
-        testBtn.setAllCaps(false);
-        testBtn.setOnClickListener(v -> doTestDelay(spinners, delayLabels, testBtn));
-        btnRow.addView(testBtn, new LinearLayout.LayoutParams(-2, dp(36)));
+        Button testBtn = makeSecondaryButton("测试延迟", v -> doTestDelay(spinners, delayLabels, testBtn));
+        btnRow.addView(testBtn, new LinearLayout.LayoutParams(-2, dp(38)));
 
         card.addView(btnRow);
 
@@ -376,14 +377,18 @@ public class ProxyConfigActivity extends Activity {
         if (nodeIndex > 0) {
             Button delBtn = new Button(this);
             delBtn.setText("✕");
-            delBtn.setTextSize(11);
+            delBtn.setTextSize(12);
+            delBtn.setAllCaps(false);
+            delBtn.setTextColor(Color.parseColor(COLOR_RED));
+            delBtn.setPadding(dp(12), dp(4), dp(12), dp(4));
+            delBtn.setBackground(roundedBackground("#FEF2F2", "#FECACA", dp(6)));
             delBtn.setOnClickListener(v -> {
                 spinners.remove(spinner);
                 delayLabels.remove(delayLabel);
                 parentCard.removeView(row);
                 renumberNodeRows(parentCard, spinners);
             });
-            row.addView(delBtn);
+            row.addView(delBtn, new LinearLayout.LayoutParams(-2, dp(34)));
         }
 
         return row;
@@ -506,6 +511,8 @@ public class ProxyConfigActivity extends Activity {
                 if (ready) {
                     // 等 mihomo 拉取订阅
                     Thread.sleep(2000);
+                    // 把每个账号的 selector 切到用户选定的主节点
+                    MihomoManager.applyNodeSelection(mihomoConfig);
                     fetchNodes();
                 }
                 runOnUiThread(() -> {
@@ -588,7 +595,12 @@ public class ProxyConfigActivity extends Activity {
             if (MihomoManager.isRunning()) {
                 new Thread(() -> {
                     boolean ok = MihomoManager.reloadConfig();
-                    runOnUiThread(() -> toast(ok ? "mihomo 已热重载" : "热重载失败，下次启动生效"));
+                    if (ok) {
+                        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+                        // 热重载后重新应用节点选择
+                        MihomoManager.applyNodeSelection(mihomoConfig);
+                    }
+                    runOnUiThread(() -> toast(ok ? "已保存并应用节点" : "热重载失败，下次启动生效"));
                 }, "mihomo-reload").start();
             }
         } catch (Throwable t) {
@@ -599,20 +611,25 @@ public class ProxyConfigActivity extends Activity {
     // ========== 状态刷新 ==========
 
     private void refreshMihomoStatus() {
+        int exitCode = MihomoManager.getLastExitCode();
         if (MihomoManager.isRunning()) {
-            mihomoStatusLabel.setText("● mihomo 运行中 · :" + MihomoManager.getApiPort());
+            mihomoStatusLabel.setText("● 运行中 · 控制端口 :" + MihomoManager.getApiPort());
             mihomoStatusLabel.setTextColor(Color.parseColor(COLOR_GREEN));
             startMihomoBtn.setEnabled(false);
             stopMihomoBtn.setEnabled(true);
-            nodeBindingSection.setVisibility(View.VISIBLE);
+        } else if (exitCode >= 0) {
+            // 进程曾启动但已退出（通常是配置错误导致 crash）
+            mihomoStatusLabel.setText("● 启动失败 · 进程已退出 (code=" + exitCode + ")，请查看日志");
+            mihomoStatusLabel.setTextColor(Color.parseColor("#DC2626"));
+            startMihomoBtn.setEnabled(true);
+            stopMihomoBtn.setEnabled(false);
         } else {
-            mihomoStatusLabel.setText("● mihomo 未运行");
+            mihomoStatusLabel.setText("● 未运行");
             mihomoStatusLabel.setTextColor(Color.parseColor(COLOR_GRAY));
             startMihomoBtn.setEnabled(true);
             stopMihomoBtn.setEnabled(false);
-            // 未运行时仍显示绑定区（可保存，等启动后选节点）
-            nodeBindingSection.setVisibility(View.VISIBLE);
         }
+        nodeBindingSection.setVisibility(View.VISIBLE);
     }
 
     private void fetchNodes() {
@@ -657,12 +674,49 @@ public class ProxyConfigActivity extends Activity {
     }
 
     private Button makeButton(String text, View.OnClickListener l) {
+        return makeSecondaryButton(text, l);
+    }
+
+    /** 主操作按钮：蓝色填充 + 白色文字。 */
+    private Button makePrimaryButton(String text, View.OnClickListener l) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setTextSize(14);
+        b.setAllCaps(false);
+        b.setTextColor(Color.WHITE);
+        b.setOnClickListener(l);
+        b.setPadding(dp(20), dp(8), dp(20), dp(8));
+        b.setBackground(roundedBackground(COLOR_PRIMARY, COLOR_PRIMARY_DARK, dp(8)));
+        return b;
+    }
+
+    /** 次操作按钮：浅灰底 + 深色文字 + 边框。 */
+    private Button makeSecondaryButton(String text, View.OnClickListener l) {
         Button b = new Button(this);
         b.setText(text);
         b.setTextSize(13);
         b.setAllCaps(false);
+        b.setTextColor(Color.parseColor(COLOR_TEXT));
         b.setOnClickListener(l);
+        b.setPadding(dp(16), dp(6), dp(16), dp(6));
+        b.setBackground(roundedBackground(COLOR_BTN_SECONDARY,
+                COLOR_BTN_SECONDARY_BORDER, dp(8)));
         return b;
+    }
+
+    /** 圆角背景：填充色 + 边框色 + 圆角半径。 */
+    private GradientDrawable roundedBackground(String fillColor, String strokeColor, int radius) {
+        GradientDrawable d = new GradientDrawable();
+        d.setShape(GradientDrawable.RECTANGLE);
+        d.setCornerRadius(radius);
+        d.setColor(Color.parseColor(fillColor));
+        d.setStroke(dp(1), Color.parseColor(strokeColor));
+        return d;
+    }
+
+    /** 卡片背景：浅色填充 + 细边框 + 圆角。 */
+    private GradientDrawable cardBackground() {
+        return roundedBackground(COLOR_CARD_BG, COLOR_DIVIDER, dp(10));
     }
 
     private void writeConfig() throws Exception {

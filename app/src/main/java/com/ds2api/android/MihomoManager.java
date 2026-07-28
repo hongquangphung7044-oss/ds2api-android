@@ -44,6 +44,8 @@ public final class MihomoManager {
     private static volatile int apiPort = DEFAULT_API_PORT;
     private static volatile String apiSecret = "";
     private static volatile File workDir;
+    /** 上次退出码：-100 从未启动，-1 启动中/运行中，>=0 已退出。 */
+    private static volatile int lastExitCode = -100;
 
     private MihomoManager() {}
 
@@ -54,6 +56,7 @@ public final class MihomoManager {
     }
     public static int getApiPort() { return apiPort; }
     public static String getApiSecret() { return apiSecret; }
+    public static int getLastExitCode() { return lastExitCode; }
 
     /** 释放 libmihomo.so 到可执行目录，返回可执行路径。 */
     static String ensureBinary(Context ctx) throws Exception {
@@ -157,6 +160,7 @@ public final class MihomoManager {
         }
         process = p;
         final Process proc = p;
+        lastExitCode = -1;
         LogStore.get().log(TAG, "进程已启动，等待 API 就绪...");
 
         // 日志读取线程
@@ -173,7 +177,11 @@ public final class MihomoManager {
                 code = -1;
             }
             LogStore.get().log(TAG, "进程已退出，exit code = " + code);
-            process = null;
+            // 只有当前进程仍是自己时才更新状态（避免覆盖手动 stop 后的重置）
+            if (process == proc) {
+                lastExitCode = code;
+                process = null;
+            }
         }, "mihomo-waiter");
         waiter.setDaemon(true);
         waiter.start();
@@ -213,6 +221,8 @@ public final class MihomoManager {
             }, "mihomo-killer").start();
             process = null;
         }
+        // 手动停止：重置为"未运行"，避免 UI 显示"已退出"
+        lastExitCode = -100;
         enabled = false;
     }
 
@@ -267,11 +277,38 @@ public final class MihomoManager {
         }
     }
 
+    /**
+     * 启动/热重载后，通过 API 把每个账号的 selector 切换到主节点。
+     * 必须在 probeReady 成功后调用。主节点失败时切到备用节点（顺位）。
+     */
+    static void applyNodeSelection(JSONObject config) {
+        if (!isRunning()) return;
+        int socks5Base = config.optInt("socks5_base_port", DEFAULT_SOCKS5_BASE_PORT);
+        List<AccountBinding> bindings = parseBindings(config, socks5Base);
+        for (AccountBinding b : bindings) {
+            if (b.nodeNames.isEmpty()) continue;
+            boolean switched = false;
+            for (String nodeName : b.nodeNames) {
+                if (switchNode(b.groupName, nodeName)) {
+                    LogStore.get().log(TAG, "账号 " + b.accountIdentifier
+                            + " → 节点: " + nodeName);
+                    switched = true;
+                    break;
+                }
+            }
+            if (!switched) {
+                LogStore.get().log(TAG, "警告: 账号 " + b.accountIdentifier
+                        + " 切换节点全部失败");
+            }
+        }
+    }
+
     // ========== 配置生成 ==========
 
     /**
      * 生成 mihomo config.yaml。
-     * 使用 listeners 多入站端口隔离，每账号一个 fallback group。
+     * 使用 listeners 多入站端口隔离，每账号一个 select group（包含订阅全部节点），
+     * 启动后通过 API 切换到用户选定的主节点，避免 filter 正则的 YAML 转义问题。
      */
     static String generateConfigYaml(String subscriptionUrl, int updateInterval,
                                      int apiPort, String secret,
@@ -282,13 +319,13 @@ public final class MihomoManager {
         sb.append("mode: rule\n");
         sb.append("log-level: info\n");
         sb.append("external-controller: 127.0.0.1:").append(apiPort).append("\n");
-        sb.append("secret: \"").append(escapeYaml(secret)).append("\"\n\n");
+        sb.append("secret: '").append(escapeYamlSingle(secret)).append("'\n\n");
 
-        // 订阅源
+        // 订阅源（URL 用单引号，避免反斜杠被解释为转义）
         sb.append("proxy-providers:\n");
         sb.append("  airport:\n");
         sb.append("    type: http\n");
-        sb.append("    url: \"").append(escapeYaml(subscriptionUrl)).append("\"\n");
+        sb.append("    url: '").append(escapeYamlSingle(subscriptionUrl)).append("'\n");
         sb.append("    interval: ").append(updateInterval).append("\n");
         sb.append("    path: ./providers/airport.yaml\n");
         sb.append("    health-check:\n");
@@ -296,15 +333,15 @@ public final class MihomoManager {
         sb.append("      url: https://chat.deepseek.com/\n");
         sb.append("      interval: 300\n\n");
 
-        // 每账号一个 fallback group
+        // 每账号一个 selector group：包含订阅全部节点，启动后通过 API 切到主节点。
+        // 不使用 filter：filter 正则需精确匹配节点名，Pattern.quote 会产生 \Q\E
+        // 反斜杠，mihomo 的 YAML 解析器在单/双引号中都会尝试解释转义导致启动失败。
+        // 改用 select + API 切换，既规避转义问题，又能灵活切换主备节点。
         sb.append("proxy-groups:\n");
         for (AccountBinding b : bindings) {
             sb.append("  - name: ").append(b.groupName).append("\n");
-            sb.append("    type: fallback\n");
-            sb.append("    use: [airport]\n");
-            sb.append("    filter: \"").append(b.filterRegex()).append("\"\n");
-            sb.append("    url: https://chat.deepseek.com/\n");
-            sb.append("    interval: 300\n\n");
+            sb.append("    type: select\n");
+            sb.append("    use: [airport]\n\n");
         }
 
         // 多入站端口隔离
@@ -463,8 +500,9 @@ public final class MihomoManager {
         }
     }
 
-    private static String escapeYaml(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    /** YAML 单引号字符串转义：单引号内只有 ' 需要转义为 ''，反斜杠是字面量。 */
+    private static String escapeYamlSingle(String s) {
+        return s.replace("'", "''");
     }
 
     private static void copy(InputStream in, OutputStream out) throws Exception {
@@ -503,18 +541,6 @@ public final class MihomoManager {
             this.index = index;
             this.groupName = "acc-" + index;
             this.proxyId = "mihomo-" + index;
-        }
-
-        /** fallback group 的 filter 正则，匹配用户选定的节点名。 */
-        String filterRegex() {
-            if (nodeNames.isEmpty()) return ".*";
-            StringBuilder sb = new StringBuilder("^(");
-            for (int i = 0; i < nodeNames.size(); i++) {
-                if (i > 0) sb.append("|");
-                sb.append(java.util.regex.Pattern.quote(nodeNames.get(i)));
-            }
-            sb.append(")$");
-            return sb.toString();
         }
     }
 }
