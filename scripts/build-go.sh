@@ -24,8 +24,11 @@ npm ci --prefix webui --no-audit --no-fund
 npm run build --prefix webui   # 产物输出到 static/admin
 
 echo ">> 交叉编译 GOOS=android GOARCH=arm64"
+VERSION="$(cat VERSION | tr -d '[:space:]')"
+echo "   注入版本号: $VERSION"
 CGO_ENABLED=0 GOOS=android GOARCH=arm64 \
-  go build -trimpath -ldflags="-s -w" -o "$WORKDIR/libds2api.so" ./cmd/ds2api
+  go build -trimpath -ldflags="-s -w -X ds2api/internal/version.BuildVersion=$VERSION" \
+  -o "$WORKDIR/libds2api.so" ./cmd/ds2api
 
 echo ">> 拷贝产物到 Android 工程"
 mkdir -p "$ROOT/app/src/main/jniLibs/arm64-v8a" "$ROOT/app/src/main/assets/webui"
