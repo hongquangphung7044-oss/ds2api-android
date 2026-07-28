@@ -328,7 +328,8 @@ public class ProxyConfigActivity extends Activity {
         });
         btnRow.addView(addBtn, new LinearLayout.LayoutParams(-2, dp(38)));
 
-        Button testBtn = makeSecondaryButton("测试延迟", v -> doTestDelay(spinners, delayLabels, testBtn));
+        Button testBtn = makeSecondaryButton("测试延迟", v -> {});
+        testBtn.setOnClickListener(v -> doTestDelay(spinners, delayLabels, testBtn));
         btnRow.addView(testBtn, new LinearLayout.LayoutParams(-2, dp(38)));
 
         card.addView(btnRow);
