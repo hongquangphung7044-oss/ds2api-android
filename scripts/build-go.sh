@@ -13,6 +13,12 @@ git clone --depth 1 --branch "$REF" https://github.com/ouqiting/ds2api "$WORKDIR
 
 cd "$WORKDIR/ds2api"
 
+echo ">> 应用 Android 兼容补丁"
+for p in "$ROOT"/patches/*.patch; do
+  [ -e "$p" ] || continue
+  git apply "$p" && echo "   applied $(basename "$p")"
+done
+
 echo ">> 构建 WebUI 静态资源"
 npm ci --prefix webui --no-audit --no-fund
 npm run build --prefix webui   # 产物输出到 static/admin

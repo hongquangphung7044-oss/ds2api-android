@@ -1,0 +1,114 @@
+From 9e80d04e62689640c6c6c54b3c40476530602eaa Mon Sep 17 00:00:00 2001
+From: android-port <android@port>
+Date: Tue, 28 Jul 2026 02:44:33 +0000
+Subject: [PATCH] =?UTF-8?q?android:=20=E6=B3=A8=E5=85=A5=E6=98=BE=E5=BC=8F?=
+ =?UTF-8?q?=20DNS=20=E6=9C=8D=E5=8A=A1=E5=99=A8=E8=A7=A3=E6=9E=90=E5=99=A8?=
+ =?UTF-8?q?=EF=BC=8C=E4=BF=AE=E5=A4=8D=E7=BA=AF=20Go=20=E6=9E=84=E5=BB=BA?=
+ =?UTF-8?q?=E5=9C=A8=20Android=20=E4=B8=8A=E6=97=A0=E6=B3=95=E8=A7=A3?=
+ =?UTF-8?q?=E6=9E=90=E5=9F=9F=E5=90=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ cmd/ds2api/main.go                    |  1 +
+ internal/platform/resolver_android.go | 64 +++++++++++++++++++++++++++
+ internal/platform/resolver_other.go   |  3 ++
+ 3 files changed, 68 insertions(+)
+ create mode 100644 internal/platform/resolver_android.go
+ create mode 100644 internal/platform/resolver_other.go
+
+diff --git a/cmd/ds2api/main.go b/cmd/ds2api/main.go
+index a4ba77e..bb8be2d 100644
+--- a/cmd/ds2api/main.go
++++ b/cmd/ds2api/main.go
+@@ -13,6 +13,7 @@ import (
+ 
+ 	"ds2api/internal/auth"
+ 	"ds2api/internal/config"
++	_ "ds2api/internal/platform" // android: 注入可用的 DNS 解析器
+ 	"ds2api/internal/server"
+ 	"ds2api/internal/webui"
+ )
+diff --git a/internal/platform/resolver_android.go b/internal/platform/resolver_android.go
+new file mode 100644
+index 0000000..7fc272f
+--- /dev/null
++++ b/internal/platform/resolver_android.go
+@@ -0,0 +1,64 @@
++//go:build android
++
++// Package platform 存放平台特定的兼容性补丁。
++//
++// Android 上没有 /etc/resolv.conf，纯 Go 构建（CGO_ENABLED=0）的 DNS 解析
++// 会退化为向 127.0.0.1:53 发包，导致所有出站域名解析失败。
++// 这里在 android 构建下注入一个显式 DNS 服务器列表的 net.DefaultResolver，
++// 可用环境变量 DS2API_DNS_SERVERS（逗号分隔，可省略端口）覆盖默认列表。
++package platform
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"os"
++	"strings"
++	"sync/atomic"
++)
++
++var defaultAndroidDNSServers = []string{
++	"223.5.5.5:53",    // 阿里 DNS
++	"119.29.29.29:53", // 腾讯 DNSPod
++	"1.2.4.8:53",      // CNNIC
++	"8.8.8.8:53",      // Google（备用，供代理/VPN 场景）
++}
++
++func init() {
++	servers := resolveServers()
++	var dialer net.Dialer
++	var next uint32
++	net.DefaultResolver = &net.Resolver{
++		PreferGo: true,
++		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
++			// Go 解析器传入的 address 是不可用的系统配置（如 127.0.0.1:53），
++			// 忽略并轮换使用显式服务器。
++			i := atomic.AddUint32(&next, 1)
++			server := servers[int(i)%len(servers)]
++			return dialer.DialContext(ctx, "udp", server)
++		},
++	}
++	fmt.Printf("[platform] android DNS resolver active, servers=%s (override with DS2API_DNS_SERVERS)\n", strings.Join(servers, ","))
++}
++
++func resolveServers() []string {
++	raw := strings.TrimSpace(os.Getenv("DS2API_DNS_SERVERS"))
++	if raw == "" {
++		return defaultAndroidDNSServers
++	}
++	var out []string
++	for _, s := range strings.Split(raw, ",") {
++		s = strings.TrimSpace(s)
++		if s == "" {
++			continue
++		}
++		if !strings.Contains(s, ":") {
++			s += ":53"
++		}
++		out = append(out, s)
++	}
++	if len(out) == 0 {
++		return defaultAndroidDNSServers
++	}
++	return out
++}
+diff --git a/internal/platform/resolver_other.go b/internal/platform/resolver_other.go
+new file mode 100644
+index 0000000..88c25ef
+--- /dev/null
++++ b/internal/platform/resolver_other.go
+@@ -0,0 +1,3 @@
++//go:build !android
++
++package platform
+-- 
+2.39.5
+
