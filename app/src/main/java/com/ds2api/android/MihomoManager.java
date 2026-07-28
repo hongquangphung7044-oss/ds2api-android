@@ -160,10 +160,11 @@ public final class MihomoManager {
             p = pb.start();
         }
         process = p;
+        final Process proc = p;
         LogStore.get().log(TAG, "进程已启动，等待 API 就绪...");
 
         // 日志读取线程
-        Thread reader = new Thread(() -> readOutput(p), "mihomo-log-reader");
+        Thread reader = new Thread(() -> readOutput(proc), "mihomo-log-reader");
         reader.setDaemon(true);
         reader.start();
 
@@ -171,7 +172,7 @@ public final class MihomoManager {
         Thread waiter = new Thread(() -> {
             int code;
             try {
-                code = p.waitFor();
+                code = proc.waitFor();
             } catch (InterruptedException e) {
                 code = -1;
             }
