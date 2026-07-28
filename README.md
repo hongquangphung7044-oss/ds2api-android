@@ -25,15 +25,20 @@
 环境：JDK 17、Android SDK（platform 35 + build-tools）、Go ≥ 1.26、Node ≥ 22（仅更新 WebUI 时需要）。
 
 ```bash
-# （可选）从上游重新构建原生二进制与 WebUI
+# 0. 全新机器一键部署构建环境（幂等；x86_64 / aarch64 均可）
+./scripts/setup-build-env.sh && source ~/.bashrc
+
+# 1.（可选）从上游重新构建原生二进制与 WebUI（自动应用 patches/ 并注入版本号）
 ./scripts/build-go.sh master
 
-# 构建 APK
+# 2. 构建 APK
 ./gradlew assembleRelease    # 产物: app/build/outputs/apk/release/app-release.apk
 ```
 
 > 仓库已内置预编译的 `libds2api.so` 与 WebUI 资源，不运行 `build-go.sh` 也能直接打包。
 > `app/keystore/ds2api.keystore` 为公开示例签名（口令 `ds2api123`），仅用于方便构建可安装的 APK，正式发布请自行更换。
+
+完整环境说明、arm64 主机 aapt2 坑位、移植要点备忘见 [docs/BUILD-ENVIRONMENT.md](docs/BUILD-ENVIRONMENT.md)。
 
 ## 与上游的版本对应
 
