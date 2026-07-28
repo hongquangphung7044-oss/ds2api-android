@@ -415,6 +415,26 @@ public final class MihomoManager {
         }
     }
 
+    /**
+     * 测试单个节点到 chat.deepseek.com 的延迟。
+     * @param nodeName 节点名（mihomo 代理名）
+     * @return 延迟毫秒数，-1 表示失败/超时
+     */
+    static int testNodeDelay(String nodeName) {
+        if (!isRunning()) return -1;
+        try {
+            String encoded = java.net.URLEncoder.encode(nodeName, "UTF-8");
+            String path = "/proxies/" + encoded + "/delay?url=https%3A%2F%2Fchat.deepseek.com%2F&timeout=5000";
+            JSONObject resp = apiGet(path);
+            if (resp != null) {
+                return resp.optInt("delay", -1);
+            }
+        } catch (Throwable t) {
+            LogStore.get().log(TAG, "测试延迟失败 [" + nodeName + "]: " + t.getMessage());
+        }
+        return -1;
+    }
+
     private static boolean apiPut(String path, String body) {
         HttpURLConnection c = null;
         try {
