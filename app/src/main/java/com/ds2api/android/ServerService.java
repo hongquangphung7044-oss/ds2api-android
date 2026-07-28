@@ -287,8 +287,10 @@ public class ServerService extends Service {
                 return;
             }
             try {
+                // 必须绕过系统代理/VPN，否则开启代理时 127.0.0.1 探测会失败造成误报
                 HttpURLConnection c = (HttpURLConnection) new URL(
-                        "http://127.0.0.1:" + PORT + "/v1/models").openConnection();
+                        "http://127.0.0.1:" + PORT + "/v1/models")
+                        .openConnection(java.net.Proxy.NO_PROXY);
                 c.setConnectTimeout(1500);
                 c.setReadTimeout(1500);
                 int code = c.getResponseCode();
