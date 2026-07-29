@@ -7,6 +7,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.text.InputType;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
@@ -611,6 +612,14 @@ public class ProxyConfigActivity extends Activity {
         delayListText.setPadding(dp(8), dp(8), dp(8), dp(8));
         delayListText.setTextColor(Color.parseColor(COLOR_TEXT));
         delayListScroll.addView(delayListText);
+        // 修复嵌套 ScrollView 滑动冲突：触摸内层延迟列表时禁止外层 ScrollView 拦截事件
+        delayListScroll.setOnTouchListener((v, event) -> {
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE) {
+                v.getParent().requestDisallowInterceptTouchEvent(true);
+            }
+            return false;
+        });
         card.addView(delayListScroll);
         // 保存引用供 doTestDelay 使用（用包装数组做 tag，避免 setTag(int) 要求 app 资源 ID）
         card.setTag(new Object[]{delayListScroll, delayListText});
