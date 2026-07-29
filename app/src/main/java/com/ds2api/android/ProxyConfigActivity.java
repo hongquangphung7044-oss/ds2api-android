@@ -359,6 +359,29 @@ public class ProxyConfigActivity extends Activity {
         containerLp.topMargin = dp(8);
         container.setLayoutParams(containerLp);
 
+        // 先创建 Spinner（删除按钮的 lambda 需要引用它）
+        Spinner spinner = new Spinner(this);
+        updateSpinnerAdapter(spinner);
+        if (!preset.isEmpty()) {
+            for (int i = 0; i < nodeList.size(); i++) {
+                if (nodeList.get(i).equals(preset)) {
+                    spinner.setSelection(i + 1);  // +1 因为第 0 项是"未选择"
+                    break;
+                }
+            }
+        }
+        spinners.add(spinner);
+
+        // 延迟徽章（带圆角背景，醒目可见）
+        TextView delayLabel = new TextView(this);
+        delayLabel.setTextSize(12);
+        delayLabel.setTextColor(Color.parseColor(COLOR_GRAY));
+        delayLabel.setGravity(Gravity.CENTER);
+        delayLabel.setPadding(dp(10), dp(2), dp(10), dp(2));
+        delayLabel.setText("—");
+        delayLabel.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
+        delayLabels.add(delayLabel);
+
         // 第一行：标签 + 延迟徽章 + 删除按钮
         LinearLayout headerRow = new LinearLayout(this);
         headerRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -371,15 +394,6 @@ public class ProxyConfigActivity extends Activity {
         label.setTypeface(Typeface.DEFAULT_BOLD);
         headerRow.addView(label, new LinearLayout.LayoutParams(-2, -2));
 
-        // 延迟徽章（带圆角背景，醒目可见）
-        TextView delayLabel = new TextView(this);
-        delayLabel.setTextSize(12);
-        delayLabel.setTextColor(Color.parseColor(COLOR_GRAY));
-        delayLabel.setGravity(Gravity.CENTER);
-        delayLabel.setPadding(dp(10), dp(2), dp(10), dp(2));
-        delayLabel.setText("—");
-        delayLabel.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
-        delayLabels.add(delayLabel);
         LinearLayout.LayoutParams delayLp = new LinearLayout.LayoutParams(-2, -2);
         delayLp.leftMargin = dp(8);
         headerRow.addView(delayLabel, delayLp);
@@ -408,17 +422,6 @@ public class ProxyConfigActivity extends Activity {
         container.addView(headerRow);
 
         // 第二行：Spinner 占满整行，有足够空间显示节点名
-        Spinner spinner = new Spinner(this);
-        updateSpinnerAdapter(spinner);
-        if (!preset.isEmpty()) {
-            for (int i = 0; i < nodeList.size(); i++) {
-                if (nodeList.get(i).equals(preset)) {
-                    spinner.setSelection(i + 1);  // +1 因为第 0 项是"未选择"
-                    break;
-                }
-            }
-        }
-        spinners.add(spinner);
         LinearLayout.LayoutParams spinLp = new LinearLayout.LayoutParams(-1, -2);
         spinLp.topMargin = dp(2);
         container.addView(spinner, spinLp);
