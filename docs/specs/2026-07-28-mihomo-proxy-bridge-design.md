@@ -2,8 +2,8 @@
 
 - 日期: 2026-07-28
 - 作者: hongquangphung7044-oss
-- 状态: 待审阅
-- 上游基准: ds2api v4.6.1
+- 状态: **已实现**（v4.6.1-mihomo-vision-fix1）
+- 上游基准: ds2api v4.6.1 + main（含视觉路由）
 
 ## 目标
 
@@ -358,3 +358,28 @@ rm -rf "$TMP"
 - 上游 ds2api Go 源码
 - patches/
 - scripts/build-go.sh
+```
+
+## 实现记录（与原设计的差异）
+
+本设计已实现于 v4.6.1-mihomo-vision-fix1。实现过程中对原设计做了以下调整：
+
+### 1. 配置存储独立化
+原设计将 mihomo 配置放在 `config.json` 的 `mihomo` 段。实际实现改为独立文件 `mihomo_config.json`，原因：ds2api Go 服务端会写回 `config.json`，嵌套的 mihomo 段会被覆盖丢失。config.yaml 生成时从独立文件读取。
+
+### 2. provider 类型改为 file（借鉴 FlClash）
+原设计用 `type: http` 让 mihomo 内核直接拉订阅。实际改为 `type: file`，由 App 层（`downloadSubscription`）下载订阅文件。原因：很多机场对 mihomo/clash 默认 UA 返回 403，App 层下载可自由控制 UA/重试/超时，绕过拦截。
+
+### 3. group 类型改为 select + 手动切换
+原设计用 `type: fallback` + filter 正则做自动故障转移。实际改为 `type: select`，由 App 层通过 API `PUT /proxies/{group}` 手动切换节点。原因：fallback 的 filter 正则对含特殊字符（emoji/中文）的节点名匹配不可靠，且用户希望明确控制使用哪个节点。故障转移改为：主节点切换失败时，App 顺位尝试 node_names 中的下一个。
+
+### 4. provider 名用索引而非哈希
+原设计 group 名为 `acc-<hash-N>`。实际用 `acc-{index}`、provider 名用 `sub-{index}`，简单稳定，避免哈希计算和特殊字符问题。
+
+### 5. 时序修复（关键 bug 修复）
+原设计第 7 步"探测 :9090 就绪"仅检查 `/version` API 可用。但此时 mihomo 的 proxy-provider 仍在异步加载订阅文件，group 引用的 provider 节点尚未就绪 → `PUT /proxies/{group}` 返回 404。
+
+修复（v4.6.1-mihomo-vision-fix1）：`applyNodeSelection` 先轮询 `fetchNodeList` 等待 provider 节点加载完成（最长 15s），再执行切换；`switchNode` 失败时重试 3 次（间隔 800ms）。`verifyProxyExit` 同样增加 3 次重试（间隔 1.5s），应对 SOCKS5 端口刚监听或 group 节点切换中的短暂 ECONNREFUSED。
+
+### 6. 视觉路由（上游功能，非本设计）
+上游 ds2api main 分支（commit 24abb927）新增视觉路由：含图片请求自动路由到 vision 模型，响应模型名回写为原模型。本 App 通过 Rebuild Native workflow 同步上游二进制即可获得此能力，无需 App 层改动。用户在 WebUI 设置中开启即可。

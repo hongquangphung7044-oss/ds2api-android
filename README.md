@@ -1,50 +1,160 @@
 # DS2API Android
 
-将 [ouqiting/ds2api](https://github.com/ouqiting/ds2api)（DeepSeek 网页版 → OpenAI / Claude / Gemini 兼容 API 代理，Go 实现）移植到 Android 的 APK 封装。
+将 [ouqiting/ds2api](https://github.com/ouqiting/ds2api)（DeepSeek 网页版 → OpenAI / Claude / Gemini 兼容 API 代理，Go 实现）移植到 Android 的 APK 封装，并集成 **mihomo 代理桥**实现多账号独立出口 IP。
 
-原理：上游 Go 服务端交叉编译为 `android/arm64` 可执行文件，以 `libds2api.so` 之名打包进 `jniLibs`，安装时随原生库释放到应用目录；App 以子进程方式启动它，并实时捕获 stdout/stderr 显示在界面上。内置上游 WebUI 静态资源，无需联网构建。
+## 它解决什么问题
 
-## 界面功能
+DeepSeek 官方对网页版账号有严格的风控：同一 IP 下多账号高频请求极易触发封号。本 App 把上游 ds2api（把 DeepSeek 网页版封装成 OpenAI 兼容 API）打包成 Android 应用，并内置 mihomo 代理桥，让**每个 DeepSeek 账号走独立的机场节点出口 IP**，从根本上降低多账号同 IP 的封号风险。
 
-- **启动服务** —— 前台服务保活，子进程运行 ds2api（默认端口 `5001`）
-- **停止服务** —— 结束子进程
-- **打开网页** —— 浏览器打开管理界面 `http://127.0.0.1:5001/admin/`
-- **实时运行日志** —— 详细输出 Go 服务端全部日志；支持“复制日志”一键复制、长按自由选择复制，方便排查问题
-- 界面同时显示 **服务地址** 与 **管理密钥（Admin Key）**，点击即可复制
+## 核心特性
 
-## 使用
+| 特性 | 说明 |
+|------|------|
+| **本地 API 服务** | 子进程运行 ds2api（默认端口 `5001`），暴露 OpenAI 兼容接口 |
+| **mihomo 代理桥** | 多订阅导入、多协议节点支持（ss/vmess/trojan/hysteria 等）、每账号独立出口节点 |
+| **视觉路由** | 含图片请求自动路由到 vision 模型，响应模型名回写为原模型（对客户端透明，上游 v4.6.1+） |
+| **节点延迟测试** | mihomo 内核 healthcheck 批量测延迟，全节点列表可滚动查看 |
+| **代理出口验证** | 一键验证代理出口 IP（ip-api / ip.sb / ipinfo.io 多源兜底） |
+| **后台保活** | 前台服务 + 电池优化豁免，降低后台被杀概率 |
+| **内置 WebUI** | 上游管理界面打包进 assets，无需联网 |
+| **实时日志** | 合并显示 ds2api + mihomo 全部日志，支持复制 |
 
-1. 安装 APK（仅支持 arm64-v8a 设备，Android 7.0+）。
-2. 点击 **启动服务**，等待日志出现 `服务就绪 ✓`。
-3. 点击 **打开网页** 进入管理界面，用界面顶部显示的管理密钥登录。
-4. 在管理界面中添加 DeepSeek 账号、创建 API Key（配置保存在应用私有目录 `config.json`，重启不丢失）。
-5. 客户端以 `http://127.0.0.1:5001/v1` 为 Base URL 调用 OpenAI 兼容接口。
+## 系统要求
 
-## 自行构建
+- Android 7.0（API 24）及以上
+- 仅支持 **arm64-v8a** 架构（覆盖绝大多数真机）
+- 机场订阅（代理功能需要，无订阅可作纯 API 代理用）
+
+## 快速开始
+
+### 1. 安装
+
+从 [Releases](https://github.com/hongquangphung7044-oss/ds2api-android/releases) 下载最新 APK 安装。首次启动会请求通知权限和电池优化豁免（建议同意，防止后台被杀）。
+
+### 2. 配置代理（可选，但推荐）
+
+1. 主界面点 **代理配置**
+2. **机场订阅** 区点 `+ 添加订阅`，填名称和订阅 URL，勾选启用
+3. 点 **启动 mihomo**，等待日志出现 `API 就绪 ✓` 和节点列表加载
+4. 在 **节点绑定** 区，为每个账号选择主节点 + 备用节点（每账号选不同节点可最大化隔离）
+5. 点 **保存配置**
+6. 点 **测试全部延迟** 查看全节点延迟列表，点 **验证代理** 确认出口 IP
+
+### 3. 启动 API 服务
+
+1. 回主界面点 **启动服务**，等待日志出现 `服务就绪 ✓`
+2. 点 **打开网页** 进入管理界面，用界面顶部显示的 **管理密钥** 登录
+3. 在 WebUI 中添加 DeepSeek 账号、创建 API Key
+4. 客户端以 `http://127.0.0.1:5001/v1` 为 Base URL 调用 OpenAI 兼容接口
+
+> 代理桥会在服务启动时自动拉起（如果已启用），无需手动启动 mihomo。
+
+## 项目结构
+
+```
+ds2api-android/
+├── app/src/main/
+│   ├── java/com/ds2api/android/
+│   │   ├── MainActivity.java          # 主界面：启停服务、日志展示、电池优化豁免
+│   │   ├── ProxyConfigActivity.java   # 代理配置界面：订阅管理、节点绑定、延迟测试
+│   │   ├── ServerService.java         # 前台服务：协调启动 ds2api + mihomo 双子进程
+│   │   ├── MihomoManager.java         # mihomo 进程管理、API 封装、代理验证
+│   │   └── LogStore.java              # 日志存储与监听
+│   ├── jniLibs/arm64-v8a/
+│   │   ├── libds2api.so               # 上游 ds2api Go 二进制（交叉编译）
+│   │   └── libmihomo.so               # mihomo 内核二进制
+│   ├── assets/
+│   │   ├── webui/                     # 上游 WebUI 预构建产物
+│   │   └── config.default.json        # 默认配置
+│   └── AndroidManifest.xml
+├── scripts/                           # 构建脚本（Go 交叉编译、mihomo 下载、环境部署）
+├── patches/                           # 上游补丁（Android DNS 修复等）
+├── docs/                              # 文档
+│   ├── ARCHITECTURE.md                # 架构概览
+│   ├── BUILD-ENVIRONMENT.md           # 构建环境部署
+│   └── specs/                         # 设计文档
+└── .github/workflows/                 # CI：Build APK + Rebuild Native
+```
+
+## 构建方式
+
+### 方式一：GitHub Actions（推荐，无需本地环境）
+
+1. **发布新版本**：修改 `app/build.gradle` 的 `versionCode`/`versionName`，提交后打 `v*` tag 推送，`Build APK` workflow 自动构建并发布 Release。
+2. **更新上游二进制**：在 Actions 页面手动触发 `Rebuild Native Binaries` workflow，它会拉取上游最新代码、应用补丁、重新编译 `libds2api.so` 和下载 `libmihomo.so`，提交回仓库。
+
+```bash
+# 发布新版本示例
+git tag -a v4.6.1-mihomo-vision-fix2 -m "修复说明"
+git push origin v4.6.1-mihomo-vision-fix2
+```
+
+### 方式二：本地构建
 
 环境：JDK 17、Android SDK（platform 35 + build-tools）、Go ≥ 1.26、Node ≥ 22（仅更新 WebUI 时需要）。
 
 ```bash
-# 0. 全新机器一键部署构建环境（幂等；x86_64 / aarch64 均可）
+# 0. 全新机器一键部署构建环境（幂等）
 ./scripts/setup-build-env.sh && source ~/.bashrc
 
 # 1.（可选）从上游重新构建原生二进制与 WebUI（自动应用 patches/ 并注入版本号）
 ./scripts/build-go.sh master
+./scripts/build-mihomo.sh v1.19.29
 
 # 2. 构建 APK
 ./gradlew assembleRelease    # 产物: app/build/outputs/apk/release/app-release.apk
 ```
 
-> 仓库已内置预编译的 `libds2api.so` 与 WebUI 资源，不运行 `build-go.sh` 也能直接打包。
-> `app/keystore/ds2api.keystore` 为公开示例签名（口令 `ds2api123`），仅用于方便构建可安装的 APK，正式发布请自行更换。
+> 仓库已内置预编译的 `libds2api.so`、`libmihomo.so` 与 WebUI 资源，不运行构建脚本也能直接打包。
+> `app/keystore/ds2api.keystore` 为公开示例签名（口令 `ds2api123`），正式发布请自行更换。
 
-完整环境说明、arm64 主机 aapt2 坑位、移植要点备忘见 [docs/BUILD-ENVIRONMENT.md](docs/BUILD-ENVIRONMENT.md)。
+详细构建环境说明见 [docs/BUILD-ENVIRONMENT.md](docs/BUILD-ENVIRONMENT.md)，架构设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
+## 配置文件说明
+
+| 文件 | 位置 | 作用 |
+|------|------|------|
+| `config.json` | 应用私有目录 | ds2api 主配置：账号、API Key、Proxy 条目（mihomo 启动时自动注入） |
+| `mihomo_config.json` | 应用私有目录 | mihomo 代理桥配置：订阅列表、账号节点绑定、启用开关 |
+| `mihomo/config.yaml` | 应用私有目录/mihomo/ | 运行时生成：proxy-providers、proxy-groups、listeners |
+
+`mihomo_config.json` 关键字段：
+
+```json
+{
+  "enabled": true,
+  "api_port": 9090,
+  "socks5_base_port": 7890,
+  "subscriptions": [
+    {"name": "机场A", "url": "https://...", "enabled": true}
+  ],
+  "accounts": [
+    {
+      "identifier": "xxx@example.com",
+      "subscription_name": "机场A",
+      "node_names": ["主节点", "备用节点"],
+      "current_node_index": 0
+    }
+  ]
+}
+```
 
 ## 与上游的版本对应
 
-| 本仓库 | 上游 ds2api |
-|--------|-------------|
-| 4.6.1  | v4.6.1      |
+| 本仓库 | 上游 ds2api | 说明 |
+|--------|-------------|------|
+| 4.6.1-mihomo-vision-fix1 | v4.6.1 + main 分支（含视觉路由） | 集成 mihomo 代理桥、视觉路由、延迟测试 |
+
+## 排查常见问题
+
+| 现象 | 排查 |
+|------|------|
+| 切换节点 404 | provider 节点未加载完，已修复（等待 15s + 重试），仍失败检查订阅是否有效 |
+| 代理验证 ECONNREFUSED | group 未切到节点或端口刚启动，已修复（重试 3 次），仍失败检查节点是否可用 |
+| 代理配置页闪退 | 删除无效订阅条目后重进，或删除 `mihomo_config.json` 重配 |
+| 后台被杀 | 同意电池优化豁免请求，或手动在系统设置加入白名单 |
+| 视觉路由不生效 | 确认 WebUI 设置中已开启，且 `libds2api.so` 为含视觉路由的版本（重新触发 Rebuild Native） |
+| 响应模型名仍是原模型 | 正常行为，视觉路由对客户端透明（请求用 vision 模型，响应回写原模型名） |
 
 ## 许可
 
