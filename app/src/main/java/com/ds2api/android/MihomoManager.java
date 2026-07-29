@@ -33,8 +33,9 @@ public final class MihomoManager {
     private static final String TAG = "mihomo";
 
     // mihomo 默认配置常量
-    public static final int DEFAULT_API_PORT = 9090;
-    public static final int DEFAULT_SOCKS5_BASE_PORT = 7890;
+    // 端口选高位段，避开 Clash/FlClash 默认的 7890/9090，降低与手机代理工具冲突概率
+    public static final int DEFAULT_API_PORT = 19090;
+    public static final int DEFAULT_SOCKS5_BASE_PORT = 17890;
     private static final int READY_PROBE_TIMEOUT_MS = 30_000;
     private static final int READY_PROBE_INTERVAL_MS = 1000;
 
@@ -42,6 +43,7 @@ public final class MihomoManager {
     private static volatile Process process;
     private static volatile boolean enabled;
     private static volatile int apiPort = DEFAULT_API_PORT;
+    private static volatile int socks5BasePort = DEFAULT_SOCKS5_BASE_PORT;
     private static volatile String apiSecret = "";
     private static volatile File workDir;
     /** 上次退出码：-100 从未启动，-1 启动中/运行中，>=0 已退出。 */
@@ -55,6 +57,7 @@ public final class MihomoManager {
         return p != null && p.isAlive();
     }
     public static int getApiPort() { return apiPort; }
+    public static int getSocks5BasePort() { return socks5BasePort; }
     public static String getApiSecret() { return apiSecret; }
     public static int getLastExitCode() { return lastExitCode; }
 
@@ -111,6 +114,22 @@ public final class MihomoManager {
         }
         int socks5Base = config.optInt("socks5_base_port", DEFAULT_SOCKS5_BASE_PORT);
         int updateInterval = config.optInt("subscription_update_interval", 3600);
+
+        // 端口占用检测：与手机代理工具（Clash/FlClash 等）冲突时自动递增找可用端口
+        // 避免启动失败或端口被抢占导致代理失效
+        int accountCount = config.optJSONArray("account_bindings") != null
+                ? config.optJSONArray("account_bindings").length() : 1;
+        int[] adjusted = findAvailablePorts(apiPort, socks5Base, accountCount);
+        if (adjusted[0] != apiPort || adjusted[1] != socks5Base) {
+            LogStore.get().log(TAG, "检测到端口被占用（可能与手机代理工具冲突），"
+                    + "API 端口 " + apiPort + "→" + adjusted[0]
+                    + "，SOCKS5 基端口 " + socks5Base + "→" + adjusted[1]);
+            apiPort = adjusted[0];
+            socks5Base = adjusted[1];
+            config.put("api_port", apiPort);
+            config.put("socks5_base_port", socks5Base);
+        }
+        socks5BasePort = socks5Base;
 
         // 解析订阅列表（支持多订阅）+ 兼容旧版单订阅字段
         List<Subscription> subs = parseSubscriptions(config);
@@ -976,6 +995,48 @@ public final class MihomoManager {
         int n;
         while ((n = in.read(buf)) != -1) {
             out.write(buf, 0, n);
+        }
+    }
+
+    /**
+     * 检测 API 端口和 N 个 SOCKS5 端口是否可用，被占用则整体递增找可用段。
+     * @return {apiPort, socks5Base} 调整后的端口
+     */
+    private static int[] findAvailablePorts(int apiPort, int socks5Base, int accountCount) {
+        // 最多尝试 50 次递增，避免无限循环
+        for (int i = 0; i < 50; i++) {
+            int tryApi = apiPort + i;
+            int trySocks = socks5Base + i;
+            boolean allFree = isPortAvailable(tryApi);
+            if (allFree) {
+                for (int j = 0; j < accountCount; j++) {
+                    if (!isPortAvailable(trySocks + j)) {
+                        allFree = false;
+                        break;
+                    }
+                }
+            }
+            if (allFree) {
+                return new int[]{tryApi, trySocks};
+            }
+        }
+        // 兜底：返回原值，让 mihomo 自己报错
+        return new int[]{apiPort, socks5Base};
+    }
+
+    /** 检测本地端口是否可绑定（未被占用）。 */
+    private static boolean isPortAvailable(int port) {
+        java.net.ServerSocket ss = null;
+        try {
+            ss = new java.net.ServerSocket(port, 0, java.net.InetAddress.getByName("127.0.0.1"));
+            ss.setReuseAddress(true);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        } finally {
+            if (ss != null) {
+                try { ss.close(); } catch (Throwable ignored) {}
+            }
         }
     }
 

@@ -149,6 +149,14 @@ public class ProxyConfigActivity extends Activity {
                 // 立即写入新文件，并从 config.json 移除
                 writeMihomoConfig();
             }
+
+            // 迁移旧端口：旧版本默认 7890/9090，与 Clash/FlClash 冲突，迁移到新默认值
+            if (mihomoConfig.optInt("socks5_base_port", 0) == 7890) {
+                mihomoConfig.put("socks5_base_port", MihomoManager.DEFAULT_SOCKS5_BASE_PORT);
+            }
+            if (mihomoConfig.optInt("api_port", 0) == 9090) {
+                mihomoConfig.put("api_port", MihomoManager.DEFAULT_API_PORT);
+            }
         } catch (Throwable t) {
             toast("加载配置失败: " + t.getMessage());
             config = new JSONObject();
@@ -844,7 +852,7 @@ public class ProxyConfigActivity extends Activity {
             toast("请先启动 mihomo");
             return;
         }
-        int socksPort = MihomoManager.DEFAULT_SOCKS5_BASE_PORT + accIndex;
+        int socksPort = MihomoManager.getSocks5BasePort() + accIndex;
         verifyLabel.setText("验证中...");
         verifyLabel.setTextColor(Color.parseColor(COLOR_GRAY));
         new Thread(() -> {
