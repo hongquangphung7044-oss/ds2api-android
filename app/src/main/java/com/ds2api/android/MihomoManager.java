@@ -158,24 +158,14 @@ public final class MihomoManager {
             throw new IllegalStateException("所有订阅均下载失败（可能是 UA 被机场拦截或订阅 URL 无效），请检查日志");
         }
 
-        // 3. 重建 bindings：只保留订阅下载成功的账号绑定
-        List<AccountBinding> okBindings = new ArrayList<>();
-        for (AccountBinding b : bindings) {
-            if (b.subscription == null) continue;
-            for (Subscription s : okSubs) {
-                if (s.providerName.equals(b.subscription.providerName)) {
-                    okBindings.add(b);
-                    break;
-                }
-            }
-        }
-        // 没有有效绑定时，给第一个账号兜底用第一个成功订阅
-        if (okBindings.isEmpty() && !bindings.isEmpty() && !okSubs.isEmpty()) {
-            AccountBinding b0 = bindings.get(0);
-            okBindings.add(new AccountBinding(b0.accountIdentifier, b0.nodeNames,
-                    b0.currentNodeIndex, b0.socksPort, b0.index, okSubs.get(0)));
-            LogStore.get().log(TAG, "账号 " + b0.accountIdentifier + " 未绑定订阅或绑定订阅失败，兜底使用 ["
-                    + okSubs.get(0).name + "]");
+        // 3. 保留所有账号绑定，不再因某个订阅失效而丢弃账号。
+        //    generateConfigYaml 会自动把每个账号 group 的 use 限定为"该账号涉及
+        //    且下载成功"的 provider；全部失效时回退 DIRECT，保证端口能监听、
+        //    其他账号不受影响。失效订阅的节点无法切换，但配置和已选节点不丢失。
+        List<AccountBinding> okBindings = bindings;
+        if (bindings.isEmpty() && !okSubs.isEmpty()) {
+            // 完全没有账号绑定时，无需特殊兜底（ds2api 会按无代理运行）
+            LogStore.get().log(TAG, "无账号节点绑定，mihomo 仅作代理桥待命");
         }
 
         // 4. 只用下载成功的订阅生成 config.yaml（避免引用不存在的 provider 文件）
@@ -437,17 +427,17 @@ public final class MihomoManager {
                     + "切换节点可能失败（请检查订阅是否有效）");
         }
 
-        // 2. 逐账号切换节点，失败则短暂重试（group 可能仍在创建中）
+        // 2. 逐账号切换节点，失败则顺位切到下一个备用节点（group 可能仍在创建中）
         for (AccountBinding b : bindings) {
-            if (b.nodeNames.isEmpty()) continue;
+            if (b.nodes.isEmpty()) continue;
             boolean switched = false;
-            for (String nodeName : b.nodeNames) {
+            for (NodeRef ref : b.nodes) {
                 // 重试 3 次，间隔 800ms（应对 group/provider 异步创建）
                 for (int attempt = 0; attempt < 3; attempt++) {
-                    if (switchNode(b.groupName, nodeName)) {
+                    if (switchNode(b.groupName, ref.nodeName)) {
                         LogStore.get().log(TAG, "账号 " + b.accountIdentifier
-                                + " → 订阅: " + (b.subscription != null ? b.subscription.name : "?")
-                                + " 节点: " + nodeName);
+                                + " → 订阅: " + ref.subscriptionName
+                                + " 节点: " + ref.nodeName);
                         switched = true;
                         break;
                     }
@@ -459,7 +449,7 @@ public final class MihomoManager {
             }
             if (!switched) {
                 LogStore.get().log(TAG, "警告: 账号 " + b.accountIdentifier
-                        + " 切换节点全部失败");
+                        + " 切换节点全部失败（订阅可能失效或节点未加载）");
             }
         }
     }
@@ -468,8 +458,10 @@ public final class MihomoManager {
 
     /**
      * 生成 mihomo config.yaml。
-     * 支持多订阅：每个订阅一个 proxy-provider，每个账号的 select group 只 use
-     * 该账号指定的订阅 provider。启动后通过 API 切换到主节点。
+     * 支持多订阅：每个订阅一个 proxy-provider；每个账号的 select group use
+     * 该账号节点涉及的所有订阅 provider（已下载成功的），从而支持一个账号
+     * 跨多个订阅选备用节点。失效订阅的 provider 不在 okSubs 中，会被自动跳过，
+     * 不会因引用不存在的 provider 导致配置加载失败。
      */
     static String generateConfigYaml(List<Subscription> subs, int updateInterval,
                                      int apiPort, String secret,
@@ -497,12 +489,36 @@ public final class MihomoManager {
             sb.append("      interval: 300\n\n");
         }
 
-        // 每账号一个 selector group，只 use 该账号指定的订阅 provider
+        // 订阅名 → provider 名映射，便于按账号节点涉及的订阅查找 provider
+        java.util.Map<String, String> subNameToProvider = new java.util.HashMap<>();
+        for (Subscription sub : subs) {
+            subNameToProvider.put(sub.name, sub.providerName);
+        }
+
+        // 每账号一个 selector group，use 该账号涉及且下载成功的订阅 provider
+        // 容错：若该账号所有订阅都失效，回退为 proxies: [DIRECT]，避免空 group 报错
         sb.append("proxy-groups:\n");
         for (AccountBinding b : bindings) {
             sb.append("  - name: ").append(b.groupName).append("\n");
             sb.append("    type: select\n");
-            sb.append("    use: [").append(b.subscription != null ? b.subscription.providerName : "DIRECT").append("]\n\n");
+            // 收集该账号涉及且下载成功的 provider 名（去重保序）
+            List<String> useProviders = new ArrayList<>();
+            for (String subName : b.subscriptionNames) {
+                String pn = subNameToProvider.get(subName);
+                if (pn != null && !useProviders.contains(pn)) useProviders.add(pn);
+            }
+            if (!useProviders.isEmpty()) {
+                sb.append("    use: [");
+                for (int k = 0; k < useProviders.size(); k++) {
+                    if (k > 0) sb.append(", ");
+                    sb.append(useProviders.get(k));
+                }
+                sb.append("]\n");
+            } else {
+                // 所有订阅都失效：用 DIRECT 兜底，保证配置能加载、端口能监听
+                sb.append("    proxies: [DIRECT]\n");
+            }
+            sb.append("\n");
         }
 
         // 多入站端口隔离
@@ -737,28 +753,33 @@ public final class MihomoManager {
             if (b == null) continue;
             String identifier = b.optString("account_identifier", "").trim();
             if (identifier.isEmpty()) continue;
-            List<String> nodeNames = new ArrayList<>();
-            JSONArray names = b.optJSONArray("node_names");
-            if (names != null) {
-                for (int j = 0; j < names.length(); j++) {
-                    String n = names.optString(j, "").trim();
-                    if (!n.isEmpty()) nodeNames.add(n);
+
+            List<NodeRef> nodes = new ArrayList<>();
+            // 新格式：nodes 数组，每项 {subscription, name}，支持跨订阅备用
+            JSONArray nodesArr = b.optJSONArray("nodes");
+            if (nodesArr != null) {
+                for (int j = 0; j < nodesArr.length(); j++) {
+                    JSONObject n = nodesArr.optJSONObject(j);
+                    if (n == null) continue;
+                    String subName = n.optString("subscription", "").trim();
+                    String nodeName = n.optString("name", "").trim();
+                    if (!nodeName.isEmpty()) nodes.add(new NodeRef(subName, nodeName));
+                }
+            } else {
+                // 兼容旧格式：node_names[] + subscription_name（单订阅）
+                String subName = b.optString("subscription_name", "").trim();
+                JSONArray names = b.optJSONArray("node_names");
+                if (names != null) {
+                    for (int j = 0; j < names.length(); j++) {
+                        String n = names.optString(j, "").trim();
+                        if (!n.isEmpty()) nodes.add(new NodeRef(subName, n));
+                    }
                 }
             }
-            // 查找该账号指定的订阅
-            String subName = b.optString("subscription_name", "").trim();
-            Subscription sub = null;
-            if (!subName.isEmpty()) {
-                for (Subscription s : subs) {
-                    if (s.name.equals(subName)) { sub = s; break; }
-                }
-            }
-            // 旧版无 subscription_name：默认用第一个订阅
-            if (sub == null && !subs.isEmpty()) sub = subs.get(0);
 
             int currentIdx = b.optInt("current_node_index", 0);
-            list.add(new AccountBinding(identifier, nodeNames, currentIdx,
-                    socks5Base + i, i, sub));
+            list.add(new AccountBinding(identifier, nodes, currentIdx,
+                    socks5Base + i, i));
         }
         return list;
     }
@@ -891,10 +912,6 @@ public final class MihomoManager {
      *                     为 null/空则回退测所有 provider（向后兼容）
      */
     static java.util.Map<String, Integer> testGroupDelay(String groupName, String providerName) {
-        java.util.Map<String, Integer> map = new java.util.HashMap<>();
-        if (!isRunning()) return map;
-
-        // 1. 确定要测试的 provider 列表：优先只测组绑定的那个订阅，避免测到其他机场节点
         List<String> providerNames;
         if (providerName != null && !providerName.isEmpty()) {
             providerNames = new ArrayList<>();
@@ -902,17 +919,28 @@ public final class MihomoManager {
         } else {
             providerNames = fetchAllProviderNames();
         }
-        if (providerNames.isEmpty()) {
+        return testProvidersDelay(groupName, providerNames);
+    }
+
+    /**
+     * 对多个订阅 provider 的所有节点批量执行延迟测试（一个账号跨多订阅选备用时用）。
+     * 只测传入的 provider 列表，不会测到账号未涉及的机场节点。
+     */
+    static java.util.Map<String, Integer> testProvidersDelay(String groupName,
+                                                              List<String> providerNames) {
+        java.util.Map<String, Integer> map = new java.util.HashMap<>();
+        if (!isRunning()) return map;
+        if (providerNames == null || providerNames.isEmpty()) {
             LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 无可用 provider（订阅未加载）");
             return map;
         }
 
-        // 2. 对每个 provider 触发 healthcheck（内核批量测延迟）
+        // 1. 对每个 provider 触发 healthcheck（内核批量测延迟）
         for (String pn : providerNames) {
             apiGet("/providers/proxies/" + pn + "/healthcheck");
         }
 
-        // 3. 轮询等待 healthcheck 完成：每 800ms 检查一次，
+        // 2. 轮询等待 healthcheck 完成：每 800ms 检查一次，
         // 当超过 90% 节点有 history 或达到上限 12s 即结束。
         long deadline = System.currentTimeMillis() + 12000;
         int totalNodes = 0;
@@ -936,7 +964,7 @@ public final class MihomoManager {
             try { Thread.sleep(800); } catch (InterruptedException ignored) { break; }
         }
 
-        // 4. 读每个 provider 的节点 history 汇总延迟
+        // 3. 读每个 provider 的节点 history 汇总延迟
         int total = 0, ok = 0;
         for (String pn : providerNames) {
             JSONObject resp = apiGet("/providers/proxies/" + pn);
@@ -1074,27 +1102,41 @@ public final class MihomoManager {
         }
     }
 
+    /** 一个节点引用：节点名 + 它所属的订阅名。支持一个账号跨多个订阅选备用节点。 */
+    static final class NodeRef {
+        final String subscriptionName;  // 订阅名（与 Subscription.name 对应）
+        final String nodeName;          // 节点名
+        NodeRef(String subscriptionName, String nodeName) {
+            this.subscriptionName = subscriptionName == null ? "" : subscriptionName;
+            this.nodeName = nodeName == null ? "" : nodeName;
+        }
+    }
+
     static final class AccountBinding {
         final String accountIdentifier;
-        final List<String> nodeNames;
+        /** 该账号的节点列表（顺序即优先级），每个节点可来自不同订阅。 */
+        final List<NodeRef> nodes;
         final int currentNodeIndex;
         final int socksPort;
         final int index;
-        final Subscription subscription;  // 该账号使用的订阅
+        /** 该账号涉及的所有订阅名（从 nodes 自动推导），用于生成 group 的 use 列表。 */
+        final java.util.Set<String> subscriptionNames;
         /** mihomo group 名，用索引保证唯一且稳定。 */
         final String groupName;
         /** ds2api Proxy ID。 */
         final String proxyId;
 
-        AccountBinding(String accountIdentifier, List<String> nodeNames,
-                       int currentNodeIndex, int socksPort, int index,
-                       Subscription subscription) {
+        AccountBinding(String accountIdentifier, List<NodeRef> nodes,
+                       int currentNodeIndex, int socksPort, int index) {
             this.accountIdentifier = accountIdentifier;
-            this.nodeNames = nodeNames;
+            this.nodes = nodes == null ? new ArrayList<>() : nodes;
             this.currentNodeIndex = currentNodeIndex;
             this.socksPort = socksPort;
             this.index = index;
-            this.subscription = subscription;
+            this.subscriptionNames = new java.util.LinkedHashSet<>();
+            for (NodeRef n : this.nodes) {
+                if (!n.subscriptionName.isEmpty()) this.subscriptionNames.add(n.subscriptionName);
+            }
             this.groupName = "acc-" + index;
             this.proxyId = "mihomo-" + index;
         }

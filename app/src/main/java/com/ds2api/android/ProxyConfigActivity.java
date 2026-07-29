@@ -79,12 +79,17 @@ public class ProxyConfigActivity extends Activity {
     private final java.util.Map<String, String> subNameToProvider = new java.util.LinkedHashMap<>();
     /** 订阅名列表（按添加顺序） */
     private final List<String> subscriptionNames = new ArrayList<>();
-    /** 每个账号的 Spinner 组 */
-    private final List<List<Spinner>> accountSpinners = new ArrayList<>();
-    private final List<List<TextView>> accountDelayLabels = new ArrayList<>();
+    /** 每个账号的节点行（每行含订阅Spinner+节点Spinner+延迟徽章），支持跨订阅选备用 */
+    private final List<List<NodeRow>> accountNodeRows = new ArrayList<>();
     private final List<String> accountIdentifiers = new ArrayList<>();
-    /** 每个账号的订阅选择 Spinner */
-    private final List<Spinner> accountSubSpinners = new ArrayList<>();
+
+    /** 一个节点选择行：订阅Spinner + 节点Spinner + 延迟徽章 + 容器视图。 */
+    private static final class NodeRow {
+        Spinner subSpinner;
+        Spinner nodeSpinner;
+        TextView delayLabel;
+        LinearLayout container;
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -348,26 +353,36 @@ public class ProxyConfigActivity extends Activity {
     }
 
     /**
-     * 刷新所有账号卡片的"订阅选择"Spinner 选项，保留各账号当前已选订阅名。
-     * 用于：新增/删除订阅、订阅改名后保持账号下拉与订阅列表一致。
+     * 订阅列表变化（新增/删除/改名）后，刷新所有节点行的订阅 Spinner 选项。
+     * 保留各行当前已选订阅名与节点名（节点名作为自定义项保留，防止订阅暂时失效丢失选择）。
      */
     private void refreshAccountSubSpinners() {
         List<String> subNames = getSubscriptionNames();
-        for (Spinner sp : accountSubSpinners) {
-            String current = sp.getSelectedItemPosition() > 0
-                    ? String.valueOf(sp.getSelectedItem()) : "";
-            List<String> options = new ArrayList<>();
-            options.add("（未选择）");
-            options.addAll(subNames);
-            ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
-                    android.R.layout.simple_spinner_item, options);
-            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-            sp.setAdapter(adapter);
-            int sel = 0;
-            for (int k = 0; k < options.size(); k++) {
-                if (options.get(k).equals(current)) { sel = k; break; }
+        for (List<NodeRow> rows : accountNodeRows) {
+            for (NodeRow row : rows) {
+                String currentSub = row.subSpinner.getSelectedItemPosition() > 0
+                        ? String.valueOf(row.subSpinner.getSelectedItem()) : "";
+                List<String> options = new ArrayList<>();
+                options.add("（未选择）");
+                options.addAll(subNames);
+                // 当前已选订阅若不在列表里（被改名/删除），追加为自定义项保留
+                if (!currentSub.isEmpty() && !options.contains(currentSub)) {
+                    options.add(currentSub);
+                }
+                ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
+                        android.R.layout.simple_spinner_item, options);
+                adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+                row.subSpinner.setAdapter(adapter);
+                int sel = 0;
+                for (int k = 0; k < options.size(); k++) {
+                    if (options.get(k).equals(currentSub)) { sel = k; break; }
+                }
+                row.subSpinner.setSelection(sel);
+                // 同步刷新该行节点选项，保留当前已选节点
+                String currentNode = (row.nodeSpinner.getSelectedItem() != null)
+                        ? row.nodeSpinner.getSelectedItem().toString() : "";
+                updateNodeSpinnerOptions(row, currentNode);
             }
-            sp.setSelection(sel);
         }
     }
 
@@ -433,10 +448,8 @@ public class ProxyConfigActivity extends Activity {
 
     private void buildAccountBindings() {
         accountListContainer.removeAllViews();
-        accountSpinners.clear();
-        accountDelayLabels.clear();
+        accountNodeRows.clear();
         accountIdentifiers.clear();
-        accountSubSpinners.clear();
 
         JSONArray accounts = config.optJSONArray("accounts");
         if (accounts == null || accounts.length() == 0) {
@@ -463,20 +476,35 @@ public class ProxyConfigActivity extends Activity {
             if (identifier.isEmpty()) identifier = acc.optString("name", "").trim();
             if (identifier.isEmpty()) continue;
 
-            JSONArray existingNodes = null;
-            String existingSubName = "";
+            // 收集该账号已保存的节点：优先新格式 nodes[]，兼容旧格式 node_names[]+subscription_name
+            List<String[]> existingNodes = new ArrayList<>();  // 每项 {subName, nodeName}
             for (int j = 0; j < bindings.length(); j++) {
                 JSONObject b = bindings.optJSONObject(j);
-                if (b != null && identifier.equals(b.optString("account_identifier", ""))) {
-                    existingNodes = b.optJSONArray("node_names");
-                    existingSubName = b.optString("subscription_name", "");
-                    break;
+                if (b == null || !identifier.equals(b.optString("account_identifier", ""))) continue;
+                JSONArray nodesArr = b.optJSONArray("nodes");
+                if (nodesArr != null) {
+                    for (int k = 0; k < nodesArr.length(); k++) {
+                        JSONObject n = nodesArr.optJSONObject(k);
+                        if (n == null) continue;
+                        String sn = n.optString("subscription", "").trim();
+                        String nm = n.optString("name", "").trim();
+                        if (!nm.isEmpty()) existingNodes.add(new String[]{sn, nm});
+                    }
+                } else {
+                    String sn = b.optString("subscription_name", "").trim();
+                    JSONArray names = b.optJSONArray("node_names");
+                    if (names != null) {
+                        for (int k = 0; k < names.length(); k++) {
+                            String nm = names.optString(k, "").trim();
+                            if (!nm.isEmpty()) existingNodes.add(new String[]{sn, nm});
+                        }
+                    }
                 }
+                break;
             }
 
             accountIdentifiers.add(identifier);
-            accountListContainer.addView(buildAccountCard(i, identifier, existingNodes,
-                    existingSubName, subNames));
+            accountListContainer.addView(buildAccountCard(i, identifier, existingNodes, subNames));
         }
     }
 
@@ -501,9 +529,9 @@ public class ProxyConfigActivity extends Activity {
         return names;
     }
 
-    /** 构建单个账号卡片。 */
-    private View buildAccountCard(int accIndex, String identifier, JSONArray existingNodes,
-                                   String presetSubName, List<String> subNames) {
+    /** 构建单个账号卡片。每个节点行独立选择订阅+节点，支持跨订阅备用。 */
+    private View buildAccountCard(int accIndex, String identifier,
+                                   List<String[]> existingNodes, List<String> subNames) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(dp(14), dp(14), dp(14), dp(14));
@@ -521,62 +549,14 @@ public class ProxyConfigActivity extends Activity {
         accLabel.setTextSize(14);
         card.addView(accLabel);
 
-        // 订阅选择行
-        LinearLayout subRow = new LinearLayout(this);
-        subRow.setOrientation(LinearLayout.HORIZONTAL);
-        subRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams subRowLp = new LinearLayout.LayoutParams(-1, -2);
-        subRowLp.topMargin = dp(6);
-        subRow.setLayoutParams(subRowLp);
+        List<NodeRow> nodeRows = new ArrayList<>();
+        accountNodeRows.add(nodeRows);
 
-        TextView subLabel = new TextView(this);
-        subLabel.setText("订阅");
-        subLabel.setTextColor(Color.parseColor(COLOR_TEXT_LIGHT));
-        subLabel.setTextSize(13);
-        subLabel.setMinWidth(dp(50));
-        subRow.addView(subLabel);
-
-        Spinner subSpinner = new Spinner(this);
-        List<String> subOptions = new ArrayList<>();
-        subOptions.add("（未选择）");
-        subOptions.addAll(subNames);
-        ArrayAdapter<String> subAdapter = new ArrayAdapter<>(this,
-                android.R.layout.simple_spinner_item, subOptions);
-        subAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        subSpinner.setAdapter(subAdapter);
-        if (!presetSubName.isEmpty()) {
-            for (int k = 0; k < subOptions.size(); k++) {
-                if (subOptions.get(k).equals(presetSubName)) {
-                    subSpinner.setSelection(k);
-                    break;
-                }
-            }
-        }
-        accountSubSpinners.add(subSpinner);
-        subRow.addView(subSpinner, new LinearLayout.LayoutParams(0, -2, 1f));
-        card.addView(subRow);
-
-        List<Spinner> spinners = new ArrayList<>();
-        List<TextView> delayLabels = new ArrayList<>();
-        accountSpinners.add(spinners);
-        accountDelayLabels.add(delayLabels);
-
-        // 切换订阅时刷新该卡片所有节点 Spinner 选项
-        subSpinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
-            @Override
-            public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
-                refreshNodeOptionsForCard(card, spinners);
-            }
-            @Override
-            public void onNothingSelected(android.widget.AdapterView<?> parent) {}
-        });
-
-        int nodeCount = (existingNodes != null && existingNodes.length() > 0)
-                ? existingNodes.length() : 1;
+        int nodeCount = Math.max(1, existingNodes.size());
         for (int n = 0; n < nodeCount; n++) {
-            String preset = (existingNodes != null && n < existingNodes.length())
-                    ? existingNodes.optString(n, "") : "";
-            card.addView(buildNodeRow(spinners, delayLabels, n, preset, card));
+            String presetSub = (n < existingNodes.size()) ? existingNodes.get(n)[0] : "";
+            String presetNode = (n < existingNodes.size()) ? existingNodes.get(n)[1] : "";
+            card.addView(buildNodeRow(nodeRows, n, presetSub, presetNode, card, subNames));
         }
 
         // 按钮行：添加备用节点 + 测试全部延迟
@@ -594,13 +574,15 @@ public class ProxyConfigActivity extends Activity {
         verifyLabel.setPadding(0, dp(4), 0, 0);
 
         Button addBtn = makeSecondaryButton("+ 添加备用", v -> {
-            int idx = spinners.size();
-            card.addView(buildNodeRow(spinners, delayLabels, idx, "", card), card.getChildCount() - 1);
+            int idx = nodeRows.size();
+            // 插到按钮行之前（btnRow 是倒数第二个子视图，delayListScroll 是最后一个）
+            int insertAt = card.indexOfChild(btnRow);
+            card.addView(buildNodeRow(nodeRows, idx, "", "", card, subNames), insertAt);
         });
         btnRow.addView(addBtn, new LinearLayout.LayoutParams(-2, dp(38)));
 
         Button testBtn = makeSecondaryButton("测试延迟", v -> {});
-        testBtn.setOnClickListener(v -> doTestDelay(spinners, delayLabels, testBtn, subSpinner, card));
+        testBtn.setOnClickListener(v -> doTestDelay(nodeRows, testBtn, card, accIndex));
         btnRow.addView(testBtn, new LinearLayout.LayoutParams(-2, dp(38)));
 
         Button verifyBtn = makeSecondaryButton("验证代理", v -> doVerifyProxy(accIndex, verifyLabel));
@@ -637,56 +619,68 @@ public class ProxyConfigActivity extends Activity {
         return card;
     }
 
-    /** 根据账号卡片中选中的订阅，刷新该卡片所有节点 Spinner 的选项。 */
-    private void refreshNodeOptionsForCard(LinearLayout card, List<Spinner> spinners) {
-        int subSpinnerIdx = -1;
-        for (int i = 0; i < accountListContainer.getChildCount(); i++) {
-            if (accountListContainer.getChildAt(i) == card) {
-                subSpinnerIdx = i;
-                break;
-            }
-        }
-        if (subSpinnerIdx < 0 || subSpinnerIdx >= accountSubSpinners.size()) return;
-        Spinner subSpinner = accountSubSpinners.get(subSpinnerIdx);
-        String subName = subSpinner.getSelectedItemPosition() == 0 ? ""
-                : subSpinner.getSelectedItem().toString();
-        List<String> nodes = subName.isEmpty() ? new ArrayList<>() : subNodeCache.get(subName);
-        if (nodes == null) nodes = new ArrayList<>();
-        for (Spinner s : spinners) {
-            updateSpinnerAdapterWithNodes(s, nodes);
-        }
-    }
-
-    private View buildNodeRow(List<Spinner> spinners, List<TextView> delayLabels,
-                              int nodeIndex, String preset, ViewGroup parentCard) {
-        // 容器：垂直两行布局，避免横向拥挤导致延迟标签被遮挡
+    /**
+     * 构建一个节点选择行：订阅Spinner + 节点Spinner（级联）。
+     * 关键容错：presetNode 即使不在当前订阅节点缓存里（订阅失效/未加载），
+     * 也作为自定义项加入节点Spinner并选中，保证已选节点不丢失。
+     */
+    private View buildNodeRow(List<NodeRow> nodeRows, int nodeIndex,
+                              String presetSub, String presetNode,
+                              ViewGroup parentCard, List<String> subNames) {
         LinearLayout container = new LinearLayout(this);
         container.setOrientation(LinearLayout.VERTICAL);
         LinearLayout.LayoutParams containerLp = new LinearLayout.LayoutParams(-1, -2);
         containerLp.topMargin = dp(8);
         container.setLayoutParams(containerLp);
 
-        // 先创建 Spinner（删除按钮的 lambda 需要引用它）
-        Spinner spinner = new Spinner(this);
-        updateSpinnerAdapter(spinner);
-        if (!preset.isEmpty()) {
-            // 在所有订阅节点中查找匹配的预设节点名
-            for (List<String> nodes : subNodeCache.values()) {
-                for (int i = 0; i < nodes.size(); i++) {
-                    if (nodes.get(i).equals(preset)) {
-                        spinner.setSelection(i + 1);  // +1 因为第 0 项是"未选择"
-                        break;
-                    }
-                }
-                if (spinner.getSelectedItem() != null
-                        && spinner.getSelectedItem().toString().equals(preset)) {
+        final NodeRow row = new NodeRow();
+        row.container = container;
+
+        // —— 订阅 Spinner ——
+        Spinner subSpinner = new Spinner(this);
+        List<String> subOptions = new ArrayList<>();
+        subOptions.add("（未选择）");
+        subOptions.addAll(subNames);
+        // 若 presetSub 不在订阅列表里（订阅被删除/改名），追加为自定义项保留选择
+        if (!presetSub.isEmpty() && !subNames.contains(presetSub)) {
+            subOptions.add(presetSub);
+        }
+        ArrayAdapter<String> subAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, subOptions);
+        subAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        subSpinner.setAdapter(subAdapter);
+        if (!presetSub.isEmpty()) {
+            for (int k = 0; k < subOptions.size(); k++) {
+                if (subOptions.get(k).equals(presetSub)) {
+                    subSpinner.setSelection(k);
                     break;
                 }
             }
         }
-        spinners.add(spinner);
+        row.subSpinner = subSpinner;
 
-        // 延迟徽章（带圆角背景，醒目可见）
+        // —— 节点 Spinner ——
+        Spinner nodeSpinner = new Spinner(this);
+        row.nodeSpinner = nodeSpinner;
+        // 先按 presetSub 填充节点选项，并保留 presetNode
+        updateNodeSpinnerOptions(row, presetNode);
+
+        // 切换订阅时刷新该行节点选项（保留当前已选节点名）
+        subSpinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
+                // 用户切换订阅后，保留当前节点选择尽量不变（若新订阅也有同名节点则保持，否则清空）
+                String currentNode = "";
+                if (nodeSpinner.getSelectedItem() != null) {
+                    currentNode = nodeSpinner.getSelectedItem().toString();
+                }
+                updateNodeSpinnerOptions(row, currentNode);
+            }
+            @Override
+            public void onNothingSelected(android.widget.AdapterView<?> parent) {}
+        });
+
+        // 延迟徽章
         TextView delayLabel = new TextView(this);
         delayLabel.setTextSize(12);
         delayLabel.setTextColor(Color.parseColor(COLOR_GRAY));
@@ -694,7 +688,8 @@ public class ProxyConfigActivity extends Activity {
         delayLabel.setPadding(dp(10), dp(2), dp(10), dp(2));
         delayLabel.setText("—");
         delayLabel.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
-        delayLabels.add(delayLabel);
+        row.delayLabel = delayLabel;
+        nodeRows.add(row);
 
         // 第一行：标签 + 延迟徽章 + 删除按钮
         LinearLayout headerRow = new LinearLayout(this);
@@ -712,7 +707,6 @@ public class ProxyConfigActivity extends Activity {
         delayLp.leftMargin = dp(8);
         headerRow.addView(delayLabel, delayLp);
 
-        // 弹性占位，把删除按钮推到右边
         View spacer = new View(this);
         headerRow.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
 
@@ -725,114 +719,148 @@ public class ProxyConfigActivity extends Activity {
             delBtn.setPadding(dp(12), dp(4), dp(12), dp(4));
             delBtn.setBackground(roundedBackground("#FEF2F2", "#FECACA", dp(6)));
             delBtn.setOnClickListener(v -> {
-                spinners.remove(spinner);
-                delayLabels.remove(delayLabel);
+                nodeRows.remove(row);
                 parentCard.removeView(container);
-                renumberNodeRows(parentCard, spinners);
+                renumberNodeRows(parentCard, nodeRows);
             });
             headerRow.addView(delBtn, new LinearLayout.LayoutParams(-2, dp(32)));
         }
 
         container.addView(headerRow);
 
-        // 第二行：Spinner 占满整行，有足够空间显示节点名
-        LinearLayout.LayoutParams spinLp = new LinearLayout.LayoutParams(-1, -2);
-        spinLp.topMargin = dp(2);
-        container.addView(spinner, spinLp);
+        // 第二行：订阅 Spinner
+        LinearLayout.LayoutParams subSpinLp = new LinearLayout.LayoutParams(-1, -2);
+        subSpinLp.topMargin = dp(2);
+        container.addView(subSpinner, subSpinLp);
+
+        // 第三行：节点 Spinner
+        LinearLayout.LayoutParams nodeSpinLp = new LinearLayout.LayoutParams(-1, -2);
+        nodeSpinLp.topMargin = dp(2);
+        container.addView(nodeSpinner, nodeSpinLp);
 
         return container;
     }
 
     /**
-     * 测试该账号所选订阅的全部节点延迟（用 group delay API 批量测试），
-     * 然后更新已选节点行的延迟徽章。
+     * 按 NodeRow 当前选中的订阅，刷新该行节点 Spinner 的选项。
+     * 关键容错：keepNode 即使不在订阅节点缓存里（订阅失效/未加载），也作为自定义项
+     * 追加并选中，保证用户已选节点不丢失、保存后不会"瞬间变回未选择"。
      */
-    private void doTestDelay(List<Spinner> spinners, List<TextView> delayLabels,
-                             Button testBtn, Spinner subSpinner, LinearLayout card) {
+    private void updateNodeSpinnerOptions(NodeRow row, String keepNode) {
+        String subName = row.subSpinner.getSelectedItemPosition() == 0 ? ""
+                : row.subSpinner.getSelectedItem().toString();
+        List<String> nodes = subName.isEmpty() ? new ArrayList<>() : subNodeCache.get(subName);
+        if (nodes == null) nodes = new ArrayList<>();
+
+        List<String> items = new ArrayList<>();
+        items.add("（未选择）");
+        items.addAll(nodes);
+        // 保留当前已选节点：若不在节点列表中（订阅失效/未加载完成），追加为自定义项
+        if (keepNode != null && !keepNode.isEmpty()
+                && !"（未选择）".equals(keepNode) && !items.contains(keepNode)) {
+            items.add(keepNode);
+        }
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, items);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        row.nodeSpinner.setAdapter(adapter);
+        // 恢复选择
+        int sel = 0;
+        if (keepNode != null && !keepNode.isEmpty()) {
+            for (int k = 0; k < items.size(); k++) {
+                if (items.get(k).equals(keepNode)) { sel = k; break; }
+            }
+        }
+        row.nodeSpinner.setSelection(sel);
+    }
+
+    /**
+     * 测试该账号所有节点行涉及订阅的全部节点延迟（healthcheck 批量测），
+     * 然后更新已选节点行的延迟徽章。一个账号跨多订阅时，合并所有涉及订阅的 provider
+     * 一起测，只测这些 provider，不会测到账号未涉及的其他机场节点。
+     */
+    private void doTestDelay(List<NodeRow> nodeRows, Button testBtn, LinearLayout card, int accIndex) {
         if (!MihomoManager.isRunning()) {
             toast("请先启动 mihomo");
             return;
         }
-        // 获取该账号选中的订阅
-        String subName = "";
-        if (subSpinner.getSelectedItemPosition() > 0) {
-            subName = subSpinner.getSelectedItem().toString();
+        // 收集该账号所有节点行选中的订阅名（去重），并映射到 provider 名
+        // 只测这些 provider，避免测到账号未涉及的其他机场节点
+        java.util.Set<String> subNames = new java.util.LinkedHashSet<>();
+        for (NodeRow row : nodeRows) {
+            if (row.subSpinner.getSelectedItemPosition() > 0) {
+                subNames.add(row.subSpinner.getSelectedItem().toString());
+            }
         }
-        if (subName.isEmpty()) {
-            toast("请先选择订阅");
+        if (subNames.isEmpty()) {
+            toast("请先为至少一个节点选择订阅");
             return;
         }
-
-        // 找到该订阅对应的 group 名（acc-{index}）
-        int accIdx = accountSubSpinners.indexOf(subSpinner);
-        String groupName = "acc-" + accIdx;
-        // 查找该订阅对应的 provider 名（sub-{index}），只测此订阅节点，避免测到其他机场
-        String providerName = subNameToProvider.get(subName);
-        // 兜底：若映射缺失（如订阅改名后未重启 mihomo），从 mihomoConfig 重建
-        if (providerName == null) {
-            JSONArray subs = mihomoConfig.optJSONArray("subscriptions");
-            if (subs != null) {
-                for (int i = 0; i < subs.length(); i++) {
-                    JSONObject s = subs.optJSONObject(i);
-                    if (s != null && subName.equals(s.optString("name", "订阅" + (i + 1)))) {
-                        providerName = "sub-" + i;
-                        break;
+        final List<String> providerNames = new ArrayList<>();
+        for (String sn : subNames) {
+            String pn = subNameToProvider.get(sn);
+            // 兜底：映射缺失时从 mihomoConfig 重建
+            if (pn == null) {
+                JSONArray subs = mihomoConfig.optJSONArray("subscriptions");
+                if (subs != null) {
+                    for (int i = 0; i < subs.length(); i++) {
+                        JSONObject s = subs.optJSONObject(i);
+                        if (s != null && sn.equals(s.optString("name", "订阅" + (i + 1)))) {
+                            pn = "sub-" + i;
+                            break;
+                        }
                     }
                 }
             }
+            if (pn != null && !providerNames.contains(pn)) providerNames.add(pn);
         }
-        // lambda 要求 effectively final，赋值给 final 副本
-        final String finalProviderName = providerName;
+        final String groupName = "acc-" + accIndex;
 
         testBtn.setEnabled(false);
         testBtn.setText("测试中...");
         // 先重置所有徽章
-        for (TextView l : delayLabels) {
-            l.setText("···");
-            l.setTextColor(Color.parseColor(COLOR_GRAY));
-            l.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
+        for (NodeRow r : nodeRows) {
+            r.delayLabel.setText("···");
+            r.delayLabel.setTextColor(Color.parseColor(COLOR_GRAY));
+            r.delayLabel.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
         }
 
         new Thread(() -> {
-            // 用 healthcheck 机制批量测试该订阅所有节点延迟（只测选中订阅，不测其他机场）
-            java.util.Map<String, Integer> delayMap = MihomoManager.testGroupDelay(groupName, finalProviderName);
+            // 批量测试该账号涉及的所有订阅 provider 的节点延迟
+            java.util.Map<String, Integer> delayMap = MihomoManager.testProvidersDelay(groupName, providerNames);
             LogStore.get().log("UI", "延迟测试完成，delayMap 大小=" + delayMap.size()
-                    + "，将更新 " + spinners.size() + " 个已选节点徽章");
+                    + "，将更新 " + nodeRows.size() + " 个已选节点徽章");
             // 如果 healthcheck 没拿到任何数据，回退到逐个测试已选节点
             if (delayMap.isEmpty()) {
-                for (int i = 0; i < spinners.size(); i++) {
-                    Spinner s = spinners.get(i);
-                    if (i >= delayLabels.size()) break;
-                    TextView label = delayLabels.get(i);
-                    Object sel = s.getSelectedItem();
-                    if (sel == null) { continue; }
+                for (int i = 0; i < nodeRows.size(); i++) {
+                    NodeRow r = nodeRows.get(i);
+                    Object sel = r.nodeSpinner.getSelectedItem();
+                    if (sel == null) continue;
                     String nodeName = sel.toString();
-                    if ("（未选择）".equals(nodeName) || nodeName.isEmpty()) { continue; }
+                    if ("（未选择）".equals(nodeName) || nodeName.isEmpty()) continue;
                     int delay = MihomoManager.testNodeDelay(nodeName);
-                    int finalI = i;
-                    runOnUiThread(() -> updateDelayBadge(delayLabels.get(finalI), delay));
+                    runOnUiThread(() -> updateDelayBadge(r.delayLabel, delay));
                 }
             } else {
                 // 更新已选节点的延迟徽章
                 int matched = 0;
-                for (int i = 0; i < spinners.size(); i++) {
-                    Spinner s = spinners.get(i);
-                    if (i >= delayLabels.size()) break;
-                    TextView label = delayLabels.get(i);
-                    Object sel = s.getSelectedItem();
-                    if (sel == null) { continue; }
+                for (NodeRow r : nodeRows) {
+                    Object sel = r.nodeSpinner.getSelectedItem();
+                    if (sel == null) {
+                        runOnUiThread(() -> r.delayLabel.setText("—"));
+                        continue;
+                    }
                     String nodeName = sel.toString();
                     if ("（未选择）".equals(nodeName) || nodeName.isEmpty()) {
-                        runOnUiThread(() -> label.setText("—"));
+                        runOnUiThread(() -> r.delayLabel.setText("—"));
                         continue;
                     }
                     Integer delay = delayMap.get(nodeName);
                     if (delay != null) matched++;
-                    int finalI = i;
                     int delayVal = delay != null ? delay : -1;
-                    runOnUiThread(() -> updateDelayBadge(delayLabels.get(finalI), delayVal));
+                    runOnUiThread(() -> updateDelayBadge(r.delayLabel, delayVal));
                 }
-                LogStore.get().log("UI", "延迟徽章更新完成，匹配 " + matched + "/" + spinners.size()
+                LogStore.get().log("UI", "延迟徽章更新完成，匹配 " + matched + "/" + nodeRows.size()
                         + " 个已选节点");
             }
             // 填充全节点延迟列表（按延迟升序，不可用节点排最后）
@@ -906,11 +934,12 @@ public class ProxyConfigActivity extends Activity {
         }
     }
 
-    private void renumberNodeRows(ViewGroup card, List<Spinner> spinners) {
+    /** 删除节点行后重新编号主/备用标签。 */
+    private void renumberNodeRows(ViewGroup card, List<NodeRow> nodeRows) {
         int spinnerIdx = 0;
         for (int i = 0; i < card.getChildCount(); i++) {
             View child = card.getChildAt(i);
-            // 新布局：container(垂直) → headerRow(水平) → label(TextView)
+            // 节点行容器(垂直) → headerRow(水平) → label(TextView)
             if (child instanceof LinearLayout) {
                 LinearLayout container = (LinearLayout) child;
                 if (container.getChildCount() > 0
@@ -922,43 +951,6 @@ public class ProxyConfigActivity extends Activity {
                         label.setText(spinnerIdx == 0 ? "主节点" : "备用 " + spinnerIdx);
                         spinnerIdx++;
                     }
-                }
-            }
-        }
-    }
-
-    private void updateSpinnerAdapter(Spinner spinner) {
-        updateSpinnerAdapterWithNodes(spinner, null);
-    }
-
-    /** 用指定节点列表更新 Spinner，nodes 为 null 时使用第一个订阅的节点。 */
-    private void updateSpinnerAdapterWithNodes(Spinner spinner, List<String> nodes) {
-        if (nodes == null) {
-            // 默认用缓存中第一个订阅的节点
-            if (!subNodeCache.isEmpty()) {
-                nodes = subNodeCache.values().iterator().next();
-            } else {
-                nodes = new ArrayList<>();
-            }
-        }
-        // 保留当前选择
-        String current = null;
-        if (spinner.getAdapter() != null && spinner.getSelectedItem() != null) {
-            current = spinner.getSelectedItem().toString();
-        }
-        List<String> items = new ArrayList<>();
-        items.add("（未选择）");
-        items.addAll(nodes);
-        ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
-                android.R.layout.simple_spinner_item, items);
-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        spinner.setAdapter(adapter);
-        // 恢复选择
-        if (current != null) {
-            for (int k = 0; k < items.size(); k++) {
-                if (items.get(k).equals(current)) {
-                    spinner.setSelection(k);
-                    break;
                 }
             }
         }
@@ -1057,34 +1049,32 @@ public class ProxyConfigActivity extends Activity {
             collectSubscriptionsFromUi();
             mihomoConfig.put("enabled", enabledCheckbox.isChecked());
 
-            // 收集账号绑定（含订阅名）
+            // 收集账号绑定：每个节点带所属订阅名（支持跨订阅备用）
             JSONArray bindings = new JSONArray();
             Set<String> seen = new HashSet<>();
             for (int i = 0; i < accountIdentifiers.size(); i++) {
                 String identifier = accountIdentifiers.get(i);
                 if (!seen.add(identifier)) continue;
-                List<Spinner> spinners = accountSpinners.get(i);
-                List<String> nodeNames = new ArrayList<>();
-                for (Spinner s : spinners) {
-                    Object sel = s.getSelectedItem();
-                    if (sel == null) continue;
-                    String name = sel.toString();
-                    if ("（未选择）".equals(name) || name.isEmpty()) continue;
-                    nodeNames.add(name);
-                }
-                // 获取该账号选中的订阅名
-                String subName = "";
-                if (i < accountSubSpinners.size()) {
-                    Spinner subSpinner = accountSubSpinners.get(i);
-                    if (subSpinner.getSelectedItemPosition() > 0) {
-                        subName = subSpinner.getSelectedItem().toString();
+                List<NodeRow> rows = accountNodeRows.get(i);
+                JSONArray nodesArr = new JSONArray();
+                for (NodeRow row : rows) {
+                    String subName = "";
+                    if (row.subSpinner.getSelectedItemPosition() > 0) {
+                        subName = row.subSpinner.getSelectedItem().toString().trim();
                     }
+                    Object sel = row.nodeSpinner.getSelectedItem();
+                    if (sel == null) continue;
+                    String nodeName = sel.toString().trim();
+                    if ("（未选择）".equals(nodeName) || nodeName.isEmpty()) continue;
+                    JSONObject n = new JSONObject();
+                    n.put("subscription", subName);
+                    n.put("name", nodeName);
+                    nodesArr.put(n);
                 }
-                if (nodeNames.isEmpty() && subName.isEmpty()) continue;
+                if (nodesArr.length() == 0) continue;
                 JSONObject b = new JSONObject();
                 b.put("account_identifier", identifier);
-                b.put("subscription_name", subName);
-                b.put("node_names", new JSONArray(nodeNames));
+                b.put("nodes", nodesArr);
                 b.put("current_node_index", 0);
                 bindings.put(b);
             }
@@ -1151,9 +1141,9 @@ public class ProxyConfigActivity extends Activity {
             runOnUiThread(() -> buildAccountBindings());
             return;
         }
-        // 获取所有 provider 名，逐个拉取节点
-        List<String> providers = MihomoManager.fetchAllProviderNames();
-        // 构建订阅名 → providerName 映射（存入字段，测延迟时按订阅隔离）
+        // 构建订阅名 → providerName 映射（存入字段，测延迟时按订阅隔离）。
+        // 注意：失效订阅的 provider 在 mihomo 中不存在，fetchNodeList 会返回空列表，
+        // 但订阅名仍保留在映射里，UI 仍可选该订阅；已选节点靠 preset 保留机制不丢失。
         subNameToProvider.clear();
         JSONArray subs = mihomoConfig.optJSONArray("subscriptions");
         if (subs != null) {
@@ -1167,17 +1157,22 @@ public class ProxyConfigActivity extends Activity {
         }
 
         subNodeCache.clear();
-        int totalNodes = 0;
         for (String subName : subNameToProvider.keySet()) {
             String providerName = subNameToProvider.get(subName);
+            // provider 不存在（订阅失效）时返回空列表，不抛异常
             List<String> nodes = MihomoManager.fetchNodeList(providerName);
             subNodeCache.put(subName, nodes);
-            totalNodes += nodes.size();
         }
 
         runOnUiThread(() -> {
-            // 重建绑定区：节点列表已就绪，preset 能正确匹配
-            buildAccountBindings();
+            if (isFinishing()) return;
+            // 重建绑定区：已选节点靠 preset 保留机制恢复（即使订阅暂时失效也不丢失）
+            try {
+                buildAccountBindings();
+            } catch (Throwable t) {
+                android.util.Log.e("ProxyConfig", "重建绑定区失败", t);
+                toast("加载节点绑定失败: " + t.getMessage());
+            }
         });
     }
 
