@@ -470,36 +470,53 @@ public final class MihomoManager {
     }
 
     /**
-     * 验证指定 SOCKS5 端口的代理是否可用：通过该端口访问 ip-api.com 获取出口 IP。
+     * 验证指定 SOCKS5 端口的代理是否可用：通过该端口访问 IP 检测服务获取出口 IP。
+     * 依次尝试多个服务，任一成功即返回。失败时记录原因便于排查。
      * @param socksPort mihomo listener 端口
      * @return 出口 IP 信息字符串，失败返回 null
      */
     static String verifyProxyExit(int socksPort) {
         java.net.Proxy proxy = new java.net.Proxy(java.net.Proxy.Type.SOCKS,
                 new java.net.InetSocketAddress("127.0.0.1", socksPort));
-        HttpURLConnection c = null;
-        try {
-            URL url = new URL("http://ip-api.com/json/?fields=query,country,city,isp");
-            c = (HttpURLConnection) url.openConnection(proxy);
-            c.setConnectTimeout(8000);
-            c.setReadTimeout(8000);
-            c.setRequestMethod("GET");
-            int code = c.getResponseCode();
-            if (code != 200) return null;
-            try (InputStream in = c.getInputStream()) {
-                byte[] data = readAll(in);
-                JSONObject resp = new JSONObject(new String(data, StandardCharsets.UTF_8));
-                String ip = resp.optString("query", "?");
-                String country = resp.optString("country", "?");
-                String city = resp.optString("city", "?");
-                String isp = resp.optString("isp", "?");
-                return ip + " | " + country + " " + city + " | " + isp;
+        // 多个 IP 检测服务，依次尝试（ip-api 国内可能被墙，ip.sb/ipinfo.io 备用）
+        String[][] services = {
+                {"http://ip-api.com/json/?fields=query,country,city,isp", "query"},
+                {"https://api.ip.sb/geoip", "ip"},
+                {"https://ipinfo.io/json", "ip"}
+        };
+        String lastErr = "";
+        for (String[] svc : services) {
+            HttpURLConnection c = null;
+            try {
+                URL url = new URL(svc[0]);
+                c = (HttpURLConnection) url.openConnection(proxy);
+                c.setConnectTimeout(10000);
+                c.setReadTimeout(10000);
+                c.setRequestMethod("GET");
+                c.setRequestProperty("User-Agent", "Mozilla/5.0");
+                int code = c.getResponseCode();
+                if (code != 200) {
+                    lastErr = svc[0] + " HTTP " + code;
+                    continue;
+                }
+                try (InputStream in = c.getInputStream()) {
+                    byte[] data = readAll(in);
+                    JSONObject resp = new JSONObject(new String(data, StandardCharsets.UTF_8));
+                    String ip = resp.optString(svc[1], "?");
+                    String country = resp.optString("country", resp.optString("country_code", "?"));
+                    String city = resp.optString("city", "");
+                    String isp = resp.optString("isp", resp.optString("org", ""));
+                    String loc = city.isEmpty() ? country : country + " " + city;
+                    return ip + " | " + loc + (isp.isEmpty() ? "" : " | " + isp);
+                }
+            } catch (Throwable t) {
+                lastErr = svc[0] + " " + t.getClass().getSimpleName() + ": " + t.getMessage();
+            } finally {
+                if (c != null) c.disconnect();
             }
-        } catch (Throwable t) {
-            return null;
-        } finally {
-            if (c != null) c.disconnect();
         }
+        LogStore.get().log(TAG, "代理验证全部失败: " + lastErr);
+        return null;
     }
 
     /**
@@ -814,12 +831,23 @@ public final class MihomoManager {
         // 2. 对每个 provider 触发 healthcheck（内核批量测延迟）
         for (String pn : providerNames) {
             // healthcheck: GET /providers/proxies/{name}/healthcheck
-            // 注意 provider 名也可能含特殊字符，但这里 provider 名是 sub-0/sub-1，安全
             apiGet("/providers/proxies/" + pn + "/healthcheck");
         }
 
-        // 3. 等待内核完成 healthcheck（同步接口已返回，但 history 写入有微小延迟）
-        try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
+        // 3. 轮询等待内核完成 healthcheck（异步执行，需等 history 写入）
+        // 最多等 20 秒，每 1 秒检查一次，一旦有节点出现 delay 就可以提前读
+        try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+        int totalNodes = 0;
+        for (String pn : providerNames) {
+            JSONObject resp = apiGet("/providers/proxies/" + pn);
+            if (resp == null) continue;
+            JSONArray proxies = resp.optJSONArray("proxies");
+            if (proxies == null) continue;
+            totalNodes += proxies.length();
+        }
+        // 如果节点多，多等一会
+        int waitMs = Math.min(15000, 2000 + totalNodes * 100);
+        try { Thread.sleep(waitMs); } catch (InterruptedException ignored) {}
 
         // 4. 读每个 provider 的节点 history 汇总延迟
         int total = 0, ok = 0;

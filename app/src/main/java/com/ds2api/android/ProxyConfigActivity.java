@@ -728,9 +728,11 @@ public class ProxyConfigActivity extends Activity {
         }
 
         new Thread(() -> {
-            // 用 group delay API 批量测试该组所有节点
+            // 用 healthcheck 机制批量测试该组所有节点延迟
             java.util.Map<String, Integer> delayMap = MihomoManager.testGroupDelay(groupName);
-            // 如果 group API 不可用，回退到逐个测试已选节点
+            LogStore.get().log("UI", "延迟测试完成，delayMap 大小=" + delayMap.size()
+                    + "，将更新 " + spinners.size() + " 个已选节点徽章");
+            // 如果 healthcheck 没拿到任何数据，回退到逐个测试已选节点
             if (delayMap.isEmpty()) {
                 for (int i = 0; i < spinners.size(); i++) {
                     Spinner s = spinners.get(i);
@@ -746,6 +748,7 @@ public class ProxyConfigActivity extends Activity {
                 }
             } else {
                 // 更新已选节点的延迟徽章
+                int matched = 0;
                 for (int i = 0; i < spinners.size(); i++) {
                     Spinner s = spinners.get(i);
                     if (i >= delayLabels.size()) break;
@@ -758,10 +761,13 @@ public class ProxyConfigActivity extends Activity {
                         continue;
                     }
                     Integer delay = delayMap.get(nodeName);
+                    if (delay != null) matched++;
                     int finalI = i;
-                    runOnUiThread(() -> updateDelayBadge(delayLabels.get(finalI),
-                            delay != null ? delay : -1));
+                    int delayVal = delay != null ? delay : -1;
+                    runOnUiThread(() -> updateDelayBadge(delayLabels.get(finalI), delayVal));
                 }
+                LogStore.get().log("UI", "延迟徽章更新完成，匹配 " + matched + "/" + spinners.size()
+                        + " 个已选节点");
             }
             runOnUiThread(() -> {
                 testBtn.setEnabled(true);
