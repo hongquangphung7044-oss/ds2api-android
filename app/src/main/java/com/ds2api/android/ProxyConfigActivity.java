@@ -979,7 +979,6 @@ public class ProxyConfigActivity extends Activity {
                 MihomoManager.start(this, workDir, mihomoConfig);
                 boolean ready = MihomoManager.probeReady();
                 if (ready) {
-                    Thread.sleep(2000);
                     MihomoManager.applyNodeSelection(mihomoConfig);
                     fetchNodes();
                 }
@@ -1064,17 +1063,32 @@ public class ProxyConfigActivity extends Activity {
             }
             mihomoConfig.put("account_bindings", bindings);
             writeMihomoConfig();
-            toast("配置已保存");
+            toast("配置已保存，正在重启 mihomo 使新端口生效...");
 
+            // 关键：热重载（reloadConfig）不会重新绑定 listeners 端口，
+            // 新增账号对应的 SOCKS5 端口（7891/7892...）无法监听 → ECONNREFUSED。
+            // 因此保存配置后必须重启 mihomo 子进程，让新端口绑定生效。
             if (MihomoManager.isRunning()) {
                 new Thread(() -> {
-                    boolean ok = MihomoManager.reloadConfig();
-                    if (ok) {
-                        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
-                        MihomoManager.applyNodeSelection(mihomoConfig);
+                    try {
+                        MihomoManager.stop();
+                        Thread.sleep(800); // 等待端口释放
+                        File workDir = new File(getFilesDir(), "mihomo");
+                        MihomoManager.start(this, workDir, mihomoConfig);
+                        boolean ready = MihomoManager.probeReady();
+                        if (ready) {
+                            MihomoManager.applyNodeSelection(mihomoConfig);
+                            fetchNodes();
+                        }
+                        final boolean finalReady = ready;
+                        runOnUiThread(() -> {
+                            refreshMihomoStatus();
+                            toast(finalReady ? "已保存并重启 mihomo" : "重启失败，请查看日志");
+                        });
+                    } catch (Throwable t2) {
+                        runOnUiThread(() -> toast("重启失败: " + t2.getMessage()));
                     }
-                    runOnUiThread(() -> toast(ok ? "已保存并应用节点" : "热重载失败，下次启动生效"));
-                }, "mihomo-reload").start();
+                }, "mihomo-restart").start();
             }
         } catch (Throwable t) {
             toast("保存失败: " + t.getMessage());
