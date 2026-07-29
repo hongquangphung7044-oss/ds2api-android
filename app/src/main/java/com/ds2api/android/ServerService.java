@@ -376,8 +376,23 @@ public class ServerService extends Service {
             LogStore.get().log("APP", "mihomo 代理桥未启用，跳过");
             return;
         }
-        String subUrl = mihomo.optString("subscription_url", "").trim();
-        if (subUrl.isEmpty()) {
+        // 检查是否有可用的订阅（支持新格式 subscriptions 数组 + 旧格式 subscription_url）
+        boolean hasSub = false;
+        JSONArray subs = mihomo.optJSONArray("subscriptions");
+        if (subs != null) {
+            for (int i = 0; i < subs.length(); i++) {
+                JSONObject s = subs.optJSONObject(i);
+                if (s != null && s.optBoolean("enabled", true)
+                        && !s.optString("url", "").trim().isEmpty()) {
+                    hasSub = true;
+                    break;
+                }
+            }
+        }
+        if (!hasSub && !mihomo.optString("subscription_url", "").trim().isEmpty()) {
+            hasSub = true;
+        }
+        if (!hasSub) {
             LogStore.get().log("APP", "mihomo 已启用但未配置订阅地址，跳过");
             return;
         }
@@ -475,6 +490,18 @@ public class ServerService extends Service {
             out.write(cfg.toString(2).getBytes(StandardCharsets.UTF_8));
         }
         LogStore.get().log("APP", "Proxy 注入完成，已写回 config.json");
+        // 验证第一个账号的代理出口 IP（确认链路可用）
+        if (bindings.length() > 0) {
+            final int firstPort = socks5Base;
+            new Thread(() -> {
+                String exit = MihomoManager.verifyProxyExit(firstPort);
+                if (exit != null) {
+                    LogStore.get().log("APP", "代理验证成功 ✓ 出口: " + exit);
+                } else {
+                    LogStore.get().log("APP", "代理验证失败 ✗ 端口 " + firstPort + " 无法访问外网");
+                }
+            }, "proxy-verify").start();
+        }
     }
 
     /** 释放内置 WebUI 静态资源；版本变化时重新释放。 */

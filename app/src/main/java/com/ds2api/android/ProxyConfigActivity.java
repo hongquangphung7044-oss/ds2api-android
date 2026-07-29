@@ -523,17 +523,27 @@ public class ProxyConfigActivity extends Activity {
         brLp.topMargin = dp(6);
         btnRow.setLayoutParams(brLp);
 
+        // 代理验证结果显示（先创建，按钮 lambda 需引用）
+        final TextView verifyLabel = new TextView(this);
+        verifyLabel.setTextSize(12);
+        verifyLabel.setTextColor(Color.parseColor(COLOR_GRAY));
+        verifyLabel.setPadding(0, dp(4), 0, 0);
+
         Button addBtn = makeSecondaryButton("+ 添加备用", v -> {
             int idx = spinners.size();
             card.addView(buildNodeRow(spinners, delayLabels, idx, "", card), card.getChildCount() - 1);
         });
         btnRow.addView(addBtn, new LinearLayout.LayoutParams(-2, dp(38)));
 
-        Button testBtn = makeSecondaryButton("测试全部延迟", v -> {});
+        Button testBtn = makeSecondaryButton("测试延迟", v -> {});
         testBtn.setOnClickListener(v -> doTestDelay(spinners, delayLabels, testBtn, subSpinner));
         btnRow.addView(testBtn, new LinearLayout.LayoutParams(-2, dp(38)));
 
+        Button verifyBtn = makeSecondaryButton("验证代理", v -> doVerifyProxy(accIndex, verifyLabel));
+        btnRow.addView(verifyBtn, new LinearLayout.LayoutParams(-2, dp(38)));
+
         card.addView(btnRow);
+        card.addView(verifyLabel);
 
         return card;
     }
@@ -718,6 +728,29 @@ public class ProxyConfigActivity extends Activity {
                 testBtn.setText("测试全部延迟");
             });
         }, "delay-test").start();
+    }
+
+    /** 验证该账号的代理是否可用：通过 mihomo SOCKS5 端口获取出口 IP。 */
+    private void doVerifyProxy(int accIndex, TextView verifyLabel) {
+        if (!MihomoManager.isRunning()) {
+            toast("请先启动 mihomo");
+            return;
+        }
+        int socksPort = MihomoManager.DEFAULT_SOCKS5_BASE_PORT + accIndex;
+        verifyLabel.setText("验证中...");
+        verifyLabel.setTextColor(Color.parseColor(COLOR_GRAY));
+        new Thread(() -> {
+            String result = MihomoManager.verifyProxyExit(socksPort);
+            runOnUiThread(() -> {
+                if (result != null) {
+                    verifyLabel.setText("出口 IP: " + result);
+                    verifyLabel.setTextColor(Color.parseColor(COLOR_GREEN));
+                } else {
+                    verifyLabel.setText("代理不可用（无法通过 SOCKS5 端口 " + socksPort + " 访问外网）");
+                    verifyLabel.setTextColor(Color.parseColor(COLOR_RED));
+                }
+            });
+        }, "proxy-verify").start();
     }
 
     /** 更新延迟徽章显示。 */

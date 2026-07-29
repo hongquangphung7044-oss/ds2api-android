@@ -404,6 +404,39 @@ public final class MihomoManager {
         return sb.toString();
     }
 
+    /**
+     * 验证指定 SOCKS5 端口的代理是否可用：通过该端口访问 ip-api.com 获取出口 IP。
+     * @param socksPort mihomo listener 端口
+     * @return 出口 IP 信息字符串，失败返回 null
+     */
+    static String verifyProxyExit(int socksPort) {
+        java.net.Proxy proxy = new java.net.Proxy(java.net.Proxy.Type.SOCKS,
+                new java.net.InetSocketAddress("127.0.0.1", socksPort));
+        HttpURLConnection c = null;
+        try {
+            URL url = new URL("http://ip-api.com/json/?fields=query,country,city,isp");
+            c = (HttpURLConnection) url.openConnection(proxy);
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(8000);
+            c.setRequestMethod("GET");
+            int code = c.getResponseCode();
+            if (code != 200) return null;
+            try (InputStream in = c.getInputStream()) {
+                byte[] data = readAll(in);
+                JSONObject resp = new JSONObject(new String(data, StandardCharsets.UTF_8));
+                String ip = resp.optString("query", "?");
+                String country = resp.optString("country", "?");
+                String city = resp.optString("city", "?");
+                String isp = resp.optString("isp", "?");
+                return ip + " | " + country + " " + city + " | " + isp;
+            }
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (c != null) c.disconnect();
+        }
+    }
+
     // ========== ds2api Proxy 注入 ==========
 
     /**
