@@ -99,6 +99,7 @@ public class ProxyConfigActivity extends Activity {
 
     private void loadConfig() {
         try {
+            // 主配置（账号列表等）从 config.json 读取
             File configFile = new File(getFilesDir(), "config.json");
             if (!configFile.exists()) {
                 try (InputStream in = getAssets().open("config.default.json")) {
@@ -109,16 +110,28 @@ public class ProxyConfigActivity extends Activity {
                 byte[] data = readAll(new java.io.FileInputStream(configFile));
                 config = new JSONObject(new String(data, StandardCharsets.UTF_8));
             }
-            mihomoConfig = config.optJSONObject("mihomo");
-            if (mihomoConfig == null) {
-                mihomoConfig = new JSONObject();
-                config.put("mihomo", mihomoConfig);
+
+            // mihomo 配置从独立文件读取，避免被 ds2api Go 服务端写回 config.json 时覆盖
+            File mihomoFile = new File(getFilesDir(), "mihomo_config.json");
+            if (mihomoFile.exists()) {
+                byte[] data = readAll(new java.io.FileInputStream(mihomoFile));
+                mihomoConfig = new JSONObject(new String(data, StandardCharsets.UTF_8));
+            } else {
+                // 迁移：旧版本把 mihomo 配置存在 config.json 里
+                JSONObject old = config.optJSONObject("mihomo");
+                if (old != null) {
+                    mihomoConfig = old;
+                    config.remove("mihomo");
+                } else {
+                    mihomoConfig = new JSONObject();
+                }
+                // 立即写入新文件，并从 config.json 移除
+                writeMihomoConfig();
             }
         } catch (Throwable t) {
             toast("加载配置失败: " + t.getMessage());
             config = new JSONObject();
             mihomoConfig = new JSONObject();
-            try { config.put("mihomo", mihomoConfig); } catch (Throwable ignored) {}
         }
     }
 
@@ -339,41 +352,41 @@ public class ProxyConfigActivity extends Activity {
 
     private View buildNodeRow(List<Spinner> spinners, List<TextView> delayLabels,
                               int nodeIndex, String preset, ViewGroup parentCard) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(-1, -2);
-        rowLp.topMargin = dp(6);
-        row.setLayoutParams(rowLp);
+        // 容器：垂直两行布局，避免横向拥挤导致延迟标签被遮挡
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams containerLp = new LinearLayout.LayoutParams(-1, -2);
+        containerLp.topMargin = dp(8);
+        container.setLayoutParams(containerLp);
+
+        // 第一行：标签 + 延迟徽章 + 删除按钮
+        LinearLayout headerRow = new LinearLayout(this);
+        headerRow.setOrientation(LinearLayout.HORIZONTAL);
+        headerRow.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView label = new TextView(this);
-        label.setText(nodeIndex == 0 ? "主节点" : "备用" + nodeIndex);
-        label.setMinWidth(dp(70));
+        label.setText(nodeIndex == 0 ? "主节点" : "备用 " + nodeIndex);
         label.setTextColor(Color.parseColor(COLOR_TEXT_LIGHT));
         label.setTextSize(13);
-        row.addView(label);
+        label.setTypeface(Typeface.DEFAULT_BOLD);
+        headerRow.addView(label, new LinearLayout.LayoutParams(-2, -2));
 
-        Spinner spinner = new Spinner(this);
-        updateSpinnerAdapter(spinner);
-        if (!preset.isEmpty()) {
-            for (int i = 0; i < nodeList.size(); i++) {
-                if (nodeList.get(i).equals(preset)) {
-                    spinner.setSelection(i + 1);  // +1 因为第 0 项是"未选择"
-                    break;
-                }
-            }
-        }
-        spinners.add(spinner);
-        row.addView(spinner, new LinearLayout.LayoutParams(0, -2, 1f));
-
-        // 延迟显示标签
+        // 延迟徽章（带圆角背景，醒目可见）
         TextView delayLabel = new TextView(this);
         delayLabel.setTextSize(12);
         delayLabel.setTextColor(Color.parseColor(COLOR_GRAY));
-        delayLabel.setMinWidth(dp(52));
         delayLabel.setGravity(Gravity.CENTER);
+        delayLabel.setPadding(dp(10), dp(2), dp(10), dp(2));
+        delayLabel.setText("—");
+        delayLabel.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
         delayLabels.add(delayLabel);
-        row.addView(delayLabel);
+        LinearLayout.LayoutParams delayLp = new LinearLayout.LayoutParams(-2, -2);
+        delayLp.leftMargin = dp(8);
+        headerRow.addView(delayLabel, delayLp);
+
+        // 弹性占位，把删除按钮推到右边
+        View spacer = new View(this);
+        headerRow.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
 
         if (nodeIndex > 0) {
             Button delBtn = new Button(this);
@@ -386,13 +399,31 @@ public class ProxyConfigActivity extends Activity {
             delBtn.setOnClickListener(v -> {
                 spinners.remove(spinner);
                 delayLabels.remove(delayLabel);
-                parentCard.removeView(row);
+                parentCard.removeView(container);
                 renumberNodeRows(parentCard, spinners);
             });
-            row.addView(delBtn, new LinearLayout.LayoutParams(-2, dp(34)));
+            headerRow.addView(delBtn, new LinearLayout.LayoutParams(-2, dp(32)));
         }
 
-        return row;
+        container.addView(headerRow);
+
+        // 第二行：Spinner 占满整行，有足够空间显示节点名
+        Spinner spinner = new Spinner(this);
+        updateSpinnerAdapter(spinner);
+        if (!preset.isEmpty()) {
+            for (int i = 0; i < nodeList.size(); i++) {
+                if (nodeList.get(i).equals(preset)) {
+                    spinner.setSelection(i + 1);  // +1 因为第 0 项是"未选择"
+                    break;
+                }
+            }
+        }
+        spinners.add(spinner);
+        LinearLayout.LayoutParams spinLp = new LinearLayout.LayoutParams(-1, -2);
+        spinLp.topMargin = dp(2);
+        container.addView(spinner, spinLp);
+
+        return container;
     }
 
     /** 测试该账号绑定的所有节点延迟。 */
@@ -403,10 +434,11 @@ public class ProxyConfigActivity extends Activity {
         }
         testBtn.setEnabled(false);
         testBtn.setText("测试中...");
-        // 先重置所有标签
+        // 先重置所有徽章
         for (TextView l : delayLabels) {
-            l.setText("...");
+            l.setText("···");
             l.setTextColor(Color.parseColor(COLOR_GRAY));
+            l.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
         }
         new Thread(() -> {
             for (int i = 0; i < spinners.size(); i++) {
@@ -415,25 +447,29 @@ public class ProxyConfigActivity extends Activity {
                 TextView label = delayLabels.get(i);
                 Object sel = s.getSelectedItem();
                 if (sel == null) {
-                    runOnUiThread(() -> label.setText("-"));
+                    runOnUiThread(() -> label.setText("—"));
                     continue;
                 }
                 String nodeName = sel.toString();
                 if ("（未选择）".equals(nodeName) || nodeName.isEmpty()) {
-                    runOnUiThread(() -> label.setText("-"));
+                    runOnUiThread(() -> label.setText("—"));
                     continue;
                 }
                 int delay = MihomoManager.testNodeDelay(nodeName);
-                int finalI = i;
                 runOnUiThread(() -> {
                     if (delay > 0) {
                         label.setText(delay + "ms");
-                        label.setTextColor(delay < 300
-                                ? Color.parseColor(COLOR_GREEN)
-                                : Color.parseColor("#B45309"));
+                        if (delay < 300) {
+                            label.setTextColor(Color.parseColor(COLOR_GREEN));
+                            label.setBackground(roundedBackground("#DCFCE7", "#BBF7D0", dp(10)));
+                        } else {
+                            label.setTextColor(Color.parseColor("#B45309"));
+                            label.setBackground(roundedBackground("#FEF3C7", "#FDE68A", dp(10)));
+                        }
                     } else {
                         label.setText("超时");
-                        label.setTextColor(Color.parseColor("#DC2626"));
+                        label.setTextColor(Color.parseColor(COLOR_RED));
+                        label.setBackground(roundedBackground("#FEE2E2", "#FECACA", dp(10)));
                     }
                 });
             }
@@ -448,13 +484,16 @@ public class ProxyConfigActivity extends Activity {
         int spinnerIdx = 0;
         for (int i = 0; i < card.getChildCount(); i++) {
             View child = card.getChildAt(i);
+            // 新布局：container(垂直) → headerRow(水平) → label(TextView)
             if (child instanceof LinearLayout) {
-                LinearLayout row = (LinearLayout) child;
-                if (row.getChildCount() > 0 && row.getChildAt(0) instanceof TextView) {
-                    TextView label = (TextView) row.getChildAt(0);
-                    String text = label.getText().toString();
-                    if (text.startsWith("主") || text.startsWith("备用")) {
-                        label.setText(spinnerIdx == 0 ? "主节点" : "备用" + spinnerIdx);
+                LinearLayout container = (LinearLayout) child;
+                if (container.getChildCount() > 0
+                        && container.getChildAt(0) instanceof LinearLayout) {
+                    LinearLayout headerRow = (LinearLayout) container.getChildAt(0);
+                    if (headerRow.getChildCount() > 0
+                            && headerRow.getChildAt(0) instanceof TextView) {
+                        TextView label = (TextView) headerRow.getChildAt(0);
+                        label.setText(spinnerIdx == 0 ? "主节点" : "备用 " + spinnerIdx);
                         spinnerIdx++;
                     }
                 }
@@ -481,7 +520,7 @@ public class ProxyConfigActivity extends Activity {
             toast("请先填写订阅地址");
             return;
         }
-        // 先保存到 config.json（mihomo 启动需要读取）
+        // 先保存到 mihomo_config.json（独立文件，避免被 Go 服务端覆盖）
         try {
             // 同步 checkbox 状态，避免覆盖用户选择
             mihomoConfig.put("enabled", enabledCheckbox.isChecked());
@@ -495,8 +534,7 @@ public class ProxyConfigActivity extends Activity {
             if (!mihomoConfig.has("subscription_update_interval")) {
                 mihomoConfig.put("subscription_update_interval", 3600);
             }
-            config.put("mihomo", mihomoConfig);
-            writeConfig();
+            writeMihomoConfig();
         } catch (Throwable t) {
             toast("保存订阅地址失败: " + t.getMessage());
             return;
@@ -589,8 +627,7 @@ public class ProxyConfigActivity extends Activity {
                 bindings.put(b);
             }
             mihomoConfig.put("account_bindings", bindings);
-            config.put("mihomo", mihomoConfig);
-            writeConfig();
+            writeMihomoConfig();
             toast("配置已保存");
 
             if (MihomoManager.isRunning()) {
@@ -724,6 +761,14 @@ public class ProxyConfigActivity extends Activity {
         File configFile = new File(getFilesDir(), "config.json");
         try (FileOutputStream out = new FileOutputStream(configFile)) {
             out.write(config.toString(2).getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    /** 将 mihomo 配置写入独立文件 mihomo_config.json，避免被 Go 服务端覆盖。 */
+    private void writeMihomoConfig() throws Exception {
+        File mihomoFile = new File(getFilesDir(), "mihomo_config.json");
+        try (FileOutputStream out = new FileOutputStream(mihomoFile)) {
+            out.write(mihomoConfig.toString(2).getBytes(StandardCharsets.UTF_8));
         }
     }
 

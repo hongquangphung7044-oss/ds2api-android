@@ -355,13 +355,23 @@ public class ServerService extends Service {
     }
 
     /**
-     * 如果 config.json 的 mihomo.enabled 为 true，启动 mihomo 子进程并注入
-     * SOCKS5 Proxy 条目到 config.json，设置各账号的 proxy_id。
+     * 从 mihomo_config.json 读取 mihomo 配置，如果 enabled=true 则启动 mihomo 子进程
+     * 并注入 SOCKS5 Proxy 条目到 config.json，设置各账号的 proxy_id。
+     *
+     * mihomo 配置存独立文件，避免被 ds2api Go 服务端写回 config.json 时覆盖丢失。
      */
     private void startMihomoIfNeeded(File configFile) throws Exception {
-        byte[] data = readAll(new java.io.FileInputStream(configFile));
-        JSONObject cfg = new JSONObject(new String(data, StandardCharsets.UTF_8));
-        JSONObject mihomo = cfg.optJSONObject("mihomo");
+        File mihomoFile = new File(getFilesDir(), "mihomo_config.json");
+        JSONObject mihomo = null;
+        if (mihomoFile.exists()) {
+            byte[] data = readAll(new java.io.FileInputStream(mihomoFile));
+            mihomo = new JSONObject(new String(data, StandardCharsets.UTF_8));
+        } else {
+            // 兼容迁移：旧版本 mihomo 配置存在 config.json 里
+            byte[] data = readAll(new java.io.FileInputStream(configFile));
+            JSONObject cfg = new JSONObject(new String(data, StandardCharsets.UTF_8));
+            mihomo = cfg.optJSONObject("mihomo");
+        }
         if (mihomo == null || !mihomo.optBoolean("enabled", false)) {
             LogStore.get().log("APP", "mihomo 代理桥未启用，跳过");
             return;
@@ -387,6 +397,8 @@ public class ServerService extends Service {
         }
 
         // 注入 Proxy 条目到 config.json
+        byte[] data = readAll(new java.io.FileInputStream(configFile));
+        JSONObject cfg = new JSONObject(new String(data, StandardCharsets.UTF_8));
         injectProxies(cfg, configFile, mihomo);
     }
 
