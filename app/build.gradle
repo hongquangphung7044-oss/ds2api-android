@@ -56,8 +56,3 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 }
-
-dependencies {
-    // Material Components：提供 Material3 主题与控件基础
-    implementation 'com.google.android.material:material:1.12.0'
-}
