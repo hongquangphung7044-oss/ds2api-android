@@ -366,6 +366,8 @@ public final class MihomoManager {
         sb.append("secret: '").append(escapeYamlSingle(secret)).append("'\n\n");
 
         // 多订阅源
+        // 注意：多数机场会拦截 mihomo 默认 User-Agent（返回 403/Forbidden），
+        // 这里显式设置常见 clash 客户端 UA，避免订阅拉取被拦。
         sb.append("proxy-providers:\n");
         for (Subscription sub : subs) {
             sb.append("  ").append(sub.providerName).append(":\n");
@@ -373,9 +375,12 @@ public final class MihomoManager {
             sb.append("    url: '").append(escapeYamlSingle(sub.url)).append("'\n");
             sb.append("    interval: ").append(updateInterval).append("\n");
             sb.append("    path: ./providers/").append(sub.providerName).append(".yaml\n");
+            sb.append("    header:\n");
+            sb.append("      User-Agent:\n");
+            sb.append("        - 'clash.meta/v1.18.0'\n");
             sb.append("    health-check:\n");
             sb.append("      enable: true\n");
-            sb.append("      url: https://chat.deepseek.com/\n");
+            sb.append("      url: http://www.gstatic.com/generate_204\n");
             sb.append("      interval: 300\n\n");
         }
 
@@ -648,47 +653,57 @@ public final class MihomoManager {
     }
 
     /**
-     * 对策略组内所有节点执行延迟测试（用 group delay API）。
-     * 这会触发 mihomo 对该组 use 的所有 provider 节点进行批量延迟测试。
+     * 对策略组内所有节点执行延迟测试。
+     * 注意：mihomo 官方 API 不存在 /group/{name}/delay（会返回 404）。
+     * 正确做法：先 GET /proxies/{groupName} 取得组内节点列表(all)，
+     * 再对每个节点并发调用 /proxies/{nodeName}/delay。
      * @param groupName 策略组名
-     * @return 节点名 → 延迟ms 的映射
+     * @return 节点名 → 延迟ms 的映射（失败的节点不含）
      */
     static java.util.Map<String, Integer> testGroupDelay(String groupName) {
         java.util.Map<String, Integer> map = new java.util.HashMap<>();
         if (!isRunning()) return map;
-        try {
-            java.net.URI uri = new java.net.URI("http", null, "127.0.0.1", apiPort,
-                    "/group/" + groupName + "/delay",
-                    "url=https%3A%2F%2Fchat.deepseek.com%2F&timeout=5000", null);
-            HttpURLConnection c = (HttpURLConnection) uri.toURL().openConnection(java.net.Proxy.NO_PROXY);
-            c.setConnectTimeout(3000);
-            c.setReadTimeout(30000);  // 批量测试需要更长时间
-            c.setRequestMethod("GET");
-            if (!apiSecret.isEmpty()) {
-                c.setRequestProperty("Authorization", "Bearer " + apiSecret);
-            }
-            int code = c.getResponseCode();
-            InputStream stream = (code >= 200 && code < 300) ? c.getInputStream() : c.getErrorStream();
-            if (stream == null) { c.disconnect(); return map; }
-            byte[] data = readAll(stream);
-            c.disconnect();
-            if (code != 200) {
-                LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] HTTP " + code
-                        + ": " + new String(data, StandardCharsets.UTF_8));
-                return map;
-            }
-            JSONObject resp = new JSONObject(new String(data, StandardCharsets.UTF_8));
-            // 返回格式: {"节点名": 延迟ms, ...}，失败的节点延迟为0或不含
-            JSONArray keys = resp.names();
-            if (keys == null) return map;
-            for (int i = 0; i < keys.length(); i++) {
-                String name = keys.optString(i);
-                int delay = resp.optInt(name, 0);
-                if (delay > 0) map.put(name, delay);
-            }
-        } catch (Throwable t) {
-            LogStore.get().log(TAG, "组延迟测试失败 [" + groupName + "]: " + t.getMessage());
+
+        // 1. 取组内节点列表
+        JSONObject group = apiGet("/proxies/" + groupName);
+        if (group == null) {
+            LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 取不到策略组（可能订阅未拉取成功）");
+            return map;
         }
+        JSONArray all = group.optJSONArray("all");
+        if (all == null || all.length() == 0) {
+            LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 组内无节点（订阅可能拉取失败，请检查日志中的 403/错误）");
+            return map;
+        }
+
+        // 2. 并发测试每个节点延迟
+        int n = all.length();
+        java.util.concurrent.ExecutorService pool =
+                java.util.concurrent.Executors.newFixedThreadPool(Math.min(n, 8));
+        java.util.concurrent.ConcurrentHashMap<String, Integer> result =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(n);
+        for (int i = 0; i < n; i++) {
+            final String nodeName = all.optString(i);
+            if (nodeName == null || nodeName.isEmpty()) { latch.countDown(); continue; }
+            pool.execute(() -> {
+                try {
+                    int delay = testNodeDelay(nodeName);
+                    if (delay > 0) result.put(nodeName, delay);
+                } catch (Throwable ignored) {
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+        try {
+            latch.await(60, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException ignored) {
+        }
+        pool.shutdownNow();
+        map.putAll(result);
+        LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 完成: "
+                + map.size() + "/" + n + " 个节点可用");
         return map;
     }
 

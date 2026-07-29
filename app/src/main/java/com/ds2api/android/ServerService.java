@@ -485,10 +485,8 @@ public class ServerService extends Service {
             }
         }
 
-        // 写回 config.json
-        try (FileOutputStream out = new FileOutputStream(configFile)) {
-            out.write(cfg.toString(2).getBytes(StandardCharsets.UTF_8));
-        }
+        // 写回 config.json（原子写：临时文件 + rename，避免与 UI 保存并发时写坏文件）
+        atomicWrite(configFile, cfg.toString(2).getBytes(StandardCharsets.UTF_8));
         LogStore.get().log("APP", "Proxy 注入完成，已写回 config.json");
         // 验证第一个账号的代理出口 IP（确认链路可用）
         if (bindings.length() > 0) {
@@ -563,6 +561,22 @@ public class ServerService extends Service {
         copy(in, bos);
         in.close();
         return bos.toByteArray();
+    }
+
+    /** 原子写入：临时文件 + fsync + rename，避免并发写或进程被杀导致配置损坏。 */
+    private static void atomicWrite(File target, byte[] data) throws Exception {
+        File tmp = new File(target.getAbsolutePath() + ".tmp");
+        try (FileOutputStream out = new FileOutputStream(tmp)) {
+            out.write(data);
+            out.flush();
+            try { out.getFD().sync(); } catch (Throwable ignored) {}
+        }
+        if (!tmp.renameTo(target)) {
+            //noinspection ResultOfMethodCallIgnored
+            target.delete();
+            //noinspection ResultOfMethodCallIgnored
+            tmp.renameTo(target);
+        }
     }
 
     private static void deleteRecursively(File f) {

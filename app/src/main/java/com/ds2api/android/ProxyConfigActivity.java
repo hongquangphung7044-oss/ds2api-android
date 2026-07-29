@@ -44,17 +44,20 @@ import java.util.Set;
  */
 public class ProxyConfigActivity extends Activity {
 
-    // 浅色风格配色（与 MainActivity 一致）
-    private static final String COLOR_BG = "#FFFFFF";
-    private static final String COLOR_TEXT = "#1F2937";
-    private static final String COLOR_TEXT_LIGHT = "#475569";
+    // Material3 风格配色（浅色 tonal palette）
+    private static final String COLOR_BG = "#F8FAFC";            // background
+    private static final String COLOR_SURFACE = "#FFFFFF";       // surface
+    private static final String COLOR_TEXT = "#1F2937";          // on-surface
+    private static final String COLOR_TEXT_LIGHT = "#475569";    // on-surface-variant
     private static final String COLOR_GREEN = "#15803D";
     private static final String COLOR_RED = "#DC2626";
     private static final String COLOR_GRAY = "#64748B";
-    private static final String COLOR_DIVIDER = "#E5E7EB";
-    private static final String COLOR_CARD_BG = "#F8FAFC";
+    private static final String COLOR_DIVIDER = "#E2E8F0";
+    private static final String COLOR_CARD_BG = "#FFFFFF";       // 卡片用纯白 + 阴影，更 M3
     private static final String COLOR_PRIMARY = "#2563EB";
     private static final String COLOR_PRIMARY_DARK = "#1D4ED8";
+    private static final String COLOR_PRIMARY_CONTAINER = "#DBEAFE";   // primary container
+    private static final String COLOR_ON_PRIMARY_CONTAINER = "#1E40AF";
     private static final String COLOR_BTN_SECONDARY = "#F1F5F9";
     private static final String COLOR_BTN_SECONDARY_BORDER = "#CBD5E1";
 
@@ -146,13 +149,14 @@ public class ProxyConfigActivity extends Activity {
         root.setPadding(dp(14), dp(14), dp(14), dp(14));
         root.setBackgroundColor(Color.parseColor(COLOR_BG));
 
-        // 标题
+        // 标题（M3 headline-small）
         TextView title = new TextView(this);
         title.setText("代理节点配置");
-        title.setTextSize(20);
+        title.setTextSize(22);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setTextColor(Color.parseColor(COLOR_TEXT));
-        title.setPadding(0, 0, 0, dp(12));
+        title.setLetterSpacing(0.01f);
+        title.setPadding(0, dp(4), 0, dp(14));
         root.addView(title);
 
         // 启用开关
@@ -251,6 +255,7 @@ public class ProxyConfigActivity extends Activity {
         rowLp.topMargin = dp(8);
         row.setLayoutParams(rowLp);
         row.setBackground(cardBackground());
+        row.setElevation(dp(2));
 
         // 第一行：名称 + 启用 + 删除
         LinearLayout header = new LinearLayout(this);
@@ -282,7 +287,11 @@ public class ProxyConfigActivity extends Activity {
         delBtn.setTextColor(Color.parseColor(COLOR_RED));
         delBtn.setPadding(dp(10), dp(4), dp(10), dp(4));
         delBtn.setBackground(roundedBackground("#FEF2F2", "#FECACA", dp(6)));
-        delBtn.setOnClickListener(v -> subscriptionListContainer.removeView(row));
+        delBtn.setOnClickListener(v -> {
+            subscriptionListContainer.removeView(row);
+            // 订阅列表变化后，刷新所有账号卡片的订阅选择下拉
+            refreshAccountSubSpinners();
+        });
         header.addView(delBtn, new LinearLayout.LayoutParams(-2, dp(32)));
 
         row.addView(header);
@@ -306,6 +315,36 @@ public class ProxyConfigActivity extends Activity {
         row.setTag(new Object[]{nameField, urlField, subEnabled});
 
         subscriptionListContainer.addView(row);
+        // 新增订阅后，立即刷新所有账号卡片的订阅选择下拉（修复"新加订阅不刷新"）
+        refreshAccountSubSpinners();
+        // 订阅名编辑后也实时同步到账号下拉，避免保存前显示旧名
+        nameField.setOnFocusChangeListener((v, hasFocus) -> {
+            if (!hasFocus) refreshAccountSubSpinners();
+        });
+    }
+
+    /**
+     * 刷新所有账号卡片的"订阅选择"Spinner 选项，保留各账号当前已选订阅名。
+     * 用于：新增/删除订阅、订阅改名后保持账号下拉与订阅列表一致。
+     */
+    private void refreshAccountSubSpinners() {
+        List<String> subNames = getSubscriptionNames();
+        for (Spinner sp : accountSubSpinners) {
+            String current = sp.getSelectedItemPosition() > 0
+                    ? String.valueOf(sp.getSelectedItem()) : "";
+            List<String> options = new ArrayList<>();
+            options.add("（未选择）");
+            options.addAll(subNames);
+            ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
+                    android.R.layout.simple_spinner_item, options);
+            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+            sp.setAdapter(adapter);
+            int sel = 0;
+            for (int k = 0; k < options.size(); k++) {
+                if (options.get(k).equals(current)) { sel = k; break; }
+            }
+            sp.setSelection(sel);
+        }
     }
 
     /** 从 UI 收集订阅列表写入 mihomoConfig。 */
@@ -448,6 +487,7 @@ public class ProxyConfigActivity extends Activity {
         cardLp.topMargin = dp(10);
         card.setLayoutParams(cardLp);
         card.setBackground(cardBackground());
+        card.setElevation(dp(2));
 
         // 账号标识
         TextView accLabel = new TextView(this);
@@ -1053,24 +1093,36 @@ public class ProxyConfigActivity extends Activity {
         return tv;
     }
 
-    /** 区块标题。 */
-    private TextView makeSectionTitle(String text) {
+    /** 区块标题：M3 title-medium 风格，左侧带主色色条。返回包含色条+文字的容器。 */
+    private View makeSectionTitle(String text) {
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.HORIZONTAL);
+        wrap.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+        lp.topMargin = dp(14);
+        lp.bottomMargin = dp(2);
+        wrap.setLayoutParams(lp);
+
+        View bar = new View(this);
+        bar.setBackgroundColor(Color.parseColor(COLOR_PRIMARY));
+        wrap.addView(bar, new LinearLayout.LayoutParams(dp(4), dp(16), 0));
+
         TextView tv = new TextView(this);
         tv.setText(text);
-        tv.setTextSize(15);
+        tv.setTextSize(16);
         tv.setTypeface(Typeface.DEFAULT_BOLD);
         tv.setTextColor(Color.parseColor(COLOR_TEXT));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = dp(10);
-        tv.setLayoutParams(lp);
-        return tv;
+        LinearLayout.LayoutParams tvLp = new LinearLayout.LayoutParams(-2, -2);
+        tvLp.leftMargin = dp(8);
+        wrap.addView(tv, tvLp);
+        return wrap;
     }
 
     private View makeDivider() {
         View div = new View(this);
         div.setBackgroundColor(Color.parseColor(COLOR_DIVIDER));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, dp(1));
-        lp.topMargin = dp(12);
+        lp.topMargin = dp(14);
         lp.bottomMargin = dp(4);
         div.setLayoutParams(lp);
         return div;
@@ -1080,7 +1132,7 @@ public class ProxyConfigActivity extends Activity {
         return makeSecondaryButton(text, l);
     }
 
-    /** 主操作按钮：蓝色填充 + 白色文字。 */
+    /** 主操作按钮：M3 filled —— 主色填充 + 白色文字 + 较大圆角。 */
     private Button makePrimaryButton(String text, View.OnClickListener l) {
         Button b = new Button(this);
         b.setText(text);
@@ -1088,22 +1140,22 @@ public class ProxyConfigActivity extends Activity {
         b.setAllCaps(false);
         b.setTextColor(Color.WHITE);
         b.setOnClickListener(l);
-        b.setPadding(dp(20), dp(8), dp(20), dp(8));
-        b.setBackground(roundedBackground(COLOR_PRIMARY, COLOR_PRIMARY_DARK, dp(8)));
+        b.setPadding(dp(24), dp(10), dp(24), dp(10));
+        b.setBackground(roundedBackground(COLOR_PRIMARY, COLOR_PRIMARY_DARK, dp(12)));
+        b.setElevation(dp(2));
         return b;
     }
 
-    /** 次操作按钮：浅灰底 + 深色文字 + 边框。 */
+    /** 次操作按钮：M3 outlined —— 透明底 + 边框 + 主色文字 + 圆角。 */
     private Button makeSecondaryButton(String text, View.OnClickListener l) {
         Button b = new Button(this);
         b.setText(text);
         b.setTextSize(13);
         b.setAllCaps(false);
-        b.setTextColor(Color.parseColor(COLOR_TEXT));
+        b.setTextColor(Color.parseColor(COLOR_PRIMARY_DARK));
         b.setOnClickListener(l);
-        b.setPadding(dp(16), dp(6), dp(16), dp(6));
-        b.setBackground(roundedBackground(COLOR_BTN_SECONDARY,
-                COLOR_BTN_SECONDARY_BORDER, dp(8)));
+        b.setPadding(dp(18), dp(8), dp(18), dp(8));
+        b.setBackground(roundedBackground("#FFFFFF", COLOR_BTN_SECONDARY_BORDER, dp(12)));
         return b;
     }
 
@@ -1117,23 +1169,39 @@ public class ProxyConfigActivity extends Activity {
         return d;
     }
 
-    /** 卡片背景：浅色填充 + 细边框 + 圆角。 */
+    /** 卡片背景：M3 surface —— 纯白 + 细边框 + 16dp 圆角 + 轻阴影。 */
     private GradientDrawable cardBackground() {
-        return roundedBackground(COLOR_CARD_BG, COLOR_DIVIDER, dp(10));
+        return roundedBackground(COLOR_CARD_BG, COLOR_DIVIDER, dp(16));
     }
 
     private void writeConfig() throws Exception {
-        File configFile = new File(getFilesDir(), "config.json");
-        try (FileOutputStream out = new FileOutputStream(configFile)) {
-            out.write(config.toString(2).getBytes(StandardCharsets.UTF_8));
-        }
+        atomicWrite(new File(getFilesDir(), "config.json"),
+                config.toString(2).getBytes(StandardCharsets.UTF_8));
     }
 
     /** 将 mihomo 配置写入独立文件 mihomo_config.json，避免被 Go 服务端覆盖。 */
     private void writeMihomoConfig() throws Exception {
-        File mihomoFile = new File(getFilesDir(), "mihomo_config.json");
-        try (FileOutputStream out = new FileOutputStream(mihomoFile)) {
-            out.write(mihomoConfig.toString(2).getBytes(StandardCharsets.UTF_8));
+        atomicWrite(new File(getFilesDir(), "mihomo_config.json"),
+                mihomoConfig.toString(2).getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * 原子写入：先写 .tmp 临时文件并 fsync，再 rename 覆盖目标文件。
+     * 避免进程被杀/中途崩溃时配置文件被写一半导致损坏丢失。
+     */
+    private void atomicWrite(File target, byte[] data) throws Exception {
+        File tmp = new File(target.getAbsolutePath() + ".tmp");
+        try (FileOutputStream out = new FileOutputStream(tmp)) {
+            out.write(data);
+            out.flush();
+            try { out.getFD().sync(); } catch (Throwable ignored) {}
+        }
+        // rename 原子替换；若失败则尝试删除目标再重命名兜底
+        if (!tmp.renameTo(target)) {
+            //noinspection ResultOfMethodCallIgnored
+            target.delete();
+            //noinspection ResultOfMethodCallIgnored
+            tmp.renameTo(target);
         }
     }
 
