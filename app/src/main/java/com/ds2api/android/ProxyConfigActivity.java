@@ -781,6 +781,8 @@ public class ProxyConfigActivity extends Activity {
                 }
             }
         }
+        // lambda 要求 effectively final，赋值给 final 副本
+        final String finalProviderName = providerName;
 
         testBtn.setEnabled(false);
         testBtn.setText("测试中...");
@@ -793,7 +795,7 @@ public class ProxyConfigActivity extends Activity {
 
         new Thread(() -> {
             // 用 healthcheck 机制批量测试该订阅所有节点延迟（只测选中订阅，不测其他机场）
-            java.util.Map<String, Integer> delayMap = MihomoManager.testGroupDelay(groupName, providerName);
+            java.util.Map<String, Integer> delayMap = MihomoManager.testGroupDelay(groupName, finalProviderName);
             LogStore.get().log("UI", "延迟测试完成，delayMap 大小=" + delayMap.size()
                     + "，将更新 " + spinners.size() + " 个已选节点徽章");
             // 如果 healthcheck 没拿到任何数据，回退到逐个测试已选节点
