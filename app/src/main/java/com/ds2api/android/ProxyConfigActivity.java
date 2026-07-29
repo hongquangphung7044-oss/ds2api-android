@@ -75,6 +75,8 @@ public class ProxyConfigActivity extends Activity {
     private JSONObject mihomoConfig;
     /** 订阅名 → 节点列表缓存 */
     private final java.util.Map<String, List<String>> subNodeCache = new java.util.LinkedHashMap<>();
+    /** 订阅名 → provider 名（sub-{index}）映射，测延迟时只测选中订阅的节点 */
+    private final java.util.Map<String, String> subNameToProvider = new java.util.LinkedHashMap<>();
     /** 订阅名列表（按添加顺序） */
     private final List<String> subscriptionNames = new ArrayList<>();
     /** 每个账号的 Spinner 组 */
@@ -764,6 +766,21 @@ public class ProxyConfigActivity extends Activity {
         // 找到该订阅对应的 group 名（acc-{index}）
         int accIdx = accountSubSpinners.indexOf(subSpinner);
         String groupName = "acc-" + accIdx;
+        // 查找该订阅对应的 provider 名（sub-{index}），只测此订阅节点，避免测到其他机场
+        String providerName = subNameToProvider.get(subName);
+        // 兜底：若映射缺失（如订阅改名后未重启 mihomo），从 mihomoConfig 重建
+        if (providerName == null) {
+            JSONArray subs = mihomoConfig.optJSONArray("subscriptions");
+            if (subs != null) {
+                for (int i = 0; i < subs.length(); i++) {
+                    JSONObject s = subs.optJSONObject(i);
+                    if (s != null && subName.equals(s.optString("name", "订阅" + (i + 1)))) {
+                        providerName = "sub-" + i;
+                        break;
+                    }
+                }
+            }
+        }
 
         testBtn.setEnabled(false);
         testBtn.setText("测试中...");
@@ -775,8 +792,8 @@ public class ProxyConfigActivity extends Activity {
         }
 
         new Thread(() -> {
-            // 用 healthcheck 机制批量测试该组所有节点延迟
-            java.util.Map<String, Integer> delayMap = MihomoManager.testGroupDelay(groupName);
+            // 用 healthcheck 机制批量测试该订阅所有节点延迟（只测选中订阅，不测其他机场）
+            java.util.Map<String, Integer> delayMap = MihomoManager.testGroupDelay(groupName, providerName);
             LogStore.get().log("UI", "延迟测试完成，delayMap 大小=" + delayMap.size()
                     + "，将更新 " + spinners.size() + " 个已选节点徽章");
             // 如果 healthcheck 没拿到任何数据，回退到逐个测试已选节点
@@ -1134,8 +1151,8 @@ public class ProxyConfigActivity extends Activity {
         }
         // 获取所有 provider 名，逐个拉取节点
         List<String> providers = MihomoManager.fetchAllProviderNames();
-        // 构建订阅名 → providerName 映射
-        java.util.Map<String, String> subNameToProvider = new java.util.HashMap<>();
+        // 构建订阅名 → providerName 映射（存入字段，测延迟时按订阅隔离）
+        subNameToProvider.clear();
         JSONArray subs = mihomoConfig.optJSONArray("subscriptions");
         if (subs != null) {
             for (int i = 0; i < subs.length(); i++) {

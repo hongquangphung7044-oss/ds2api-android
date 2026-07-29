@@ -885,13 +885,23 @@ public final class MihomoManager {
      * 2. GET /providers/proxies/{name} 读每个节点 history 取延迟
      * 内核自己测自己读，不依赖节点名 URL 编码，100% 可靠。
      * 不做任何过滤（healthcheck 只测 provider 内的真实 proxy，广告伪节点本就不在 provider 里）。
+     *
+     * @param groupName    策略组名（仅用于日志）
+     * @param providerName 该组绑定的订阅 provider 名（sub-{index}），只测此 provider 的节点；
+     *                     为 null/空则回退测所有 provider（向后兼容）
      */
-    static java.util.Map<String, Integer> testGroupDelay(String groupName) {
+    static java.util.Map<String, Integer> testGroupDelay(String groupName, String providerName) {
         java.util.Map<String, Integer> map = new java.util.HashMap<>();
         if (!isRunning()) return map;
 
-        // 1. 获取所有 provider 名
-        List<String> providerNames = fetchAllProviderNames();
+        // 1. 确定要测试的 provider 列表：优先只测组绑定的那个订阅，避免测到其他机场节点
+        List<String> providerNames;
+        if (providerName != null && !providerName.isEmpty()) {
+            providerNames = new ArrayList<>();
+            providerNames.add(providerName);
+        } else {
+            providerNames = fetchAllProviderNames();
+        }
         if (providerNames.isEmpty()) {
             LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 无可用 provider（订阅未加载）");
             return map;
