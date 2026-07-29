@@ -73,10 +73,10 @@ public class ProxyConfigActivity extends Activity {
 
     private JSONObject config;
     private JSONObject mihomoConfig;
-    /** 订阅名 → 节点列表缓存 */
-    private final java.util.Map<String, List<String>> subNodeCache = new java.util.LinkedHashMap<>();
-    /** 订阅名 → provider 名（sub-{index}）映射，测延迟时只测选中订阅的节点 */
-    private final java.util.Map<String, String> subNameToProvider = new java.util.LinkedHashMap<>();
+    /** 订阅名 → 节点列表缓存（线程安全，后台 fetchNodes 与主线程 UI 读并发访问） */
+    private final java.util.Map<String, List<String>> subNodeCache = java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>());
+    /** 订阅名 → provider 名（sub-{index}）映射，测延迟时按订阅隔离（线程安全） */
+    private final java.util.Map<String, String> subNameToProvider = java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>());
     /** 订阅名列表（按添加顺序） */
     private final List<String> subscriptionNames = new ArrayList<>();
     /** 每个账号的节点行（每行含订阅Spinner+节点Spinner+延迟徽章），支持跨订阅选备用 */
@@ -89,7 +89,12 @@ public class ProxyConfigActivity extends Activity {
         Spinner nodeSpinner;
         TextView delayLabel;
         LinearLayout container;
+        /** 防止 setSelection 同步触发 onItemSelected 导致递归刷新节点列表 */
+        boolean suppressNodeRefresh = false;
     }
+
+    /** fetchNodes 并发保护：onCreate 与 onResume 可能同时触发，避免两个线程并发改缓存导致崩溃 */
+    private volatile boolean fetchNodesRunning = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -113,13 +118,22 @@ public class ProxyConfigActivity extends Activity {
         if (MihomoManager.isRunning()) {
             new Thread(this::fetchNodes, "node-fetcher").start();
         }
-        refreshMihomoStatus();
+        try {
+            refreshMihomoStatus();
+        } catch (Throwable t) {
+            android.util.Log.e("ProxyConfig", "refreshMihomoStatus 失败", t);
+        }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        refreshMihomoStatus();
+        try {
+            refreshMihomoStatus();
+        } catch (Throwable t) {
+            android.util.Log.e("ProxyConfig", "onResume refreshMihomoStatus 失败", t);
+        }
+        // subNodeCache.isEmpty() 在 synchronizedMap 上是线程安全单次调用
         if (MihomoManager.isRunning() && subNodeCache.isEmpty()) {
             new Thread(this::fetchNodes, "node-fetcher").start();
         }
@@ -392,8 +406,10 @@ public class ProxyConfigActivity extends Activity {
         for (int i = 0; i < subscriptionListContainer.getChildCount(); i++) {
             View child = subscriptionListContainer.getChildAt(i);
             if (child instanceof LinearLayout) {
-                Object[] tags = (Object[]) child.getTag();
-                if (tags == null || tags.length < 3) continue;
+                Object tagObj = child.getTag();
+                if (!(tagObj instanceof Object[])) continue;
+                Object[] tags = (Object[]) tagObj;
+                if (tags.length < 3) continue;
                 EditText nameField = (EditText) tags[0];
                 EditText urlField = (EditText) tags[1];
                 CheckBox subEnabled = (CheckBox) tags[2];
@@ -514,8 +530,10 @@ public class ProxyConfigActivity extends Activity {
         for (int i = 0; i < subscriptionListContainer.getChildCount(); i++) {
             View child = subscriptionListContainer.getChildAt(i);
             if (child instanceof LinearLayout) {
-                Object[] tags = (Object[]) child.getTag();
-                if (tags == null || tags.length < 3) continue;
+                Object tagObj = child.getTag();
+                if (!(tagObj instanceof Object[])) continue;
+                Object[] tags = (Object[]) tagObj;
+                if (tags.length < 3) continue;
                 EditText nameField = (EditText) tags[0];
                 EditText urlField = (EditText) tags[1];
                 CheckBox subEnabled = (CheckBox) tags[2];
@@ -669,6 +687,7 @@ public class ProxyConfigActivity extends Activity {
         subSpinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
             @Override
             public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
+                if (row.suppressNodeRefresh) return;  // 程序内 setSelection 触发，跳过递归刷新
                 // 用户切换订阅后，保留当前节点选择尽量不变（若新订阅也有同名节点则保持，否则清空）
                 String currentNode = "";
                 if (nodeSpinner.getSelectedItem() != null) {
@@ -749,8 +768,16 @@ public class ProxyConfigActivity extends Activity {
     private void updateNodeSpinnerOptions(NodeRow row, String keepNode) {
         String subName = row.subSpinner.getSelectedItemPosition() == 0 ? ""
                 : row.subSpinner.getSelectedItem().toString();
-        List<String> nodes = subName.isEmpty() ? new ArrayList<>() : subNodeCache.get(subName);
-        if (nodes == null) nodes = new ArrayList<>();
+        // synchronizedMap 遍历需在外部同步，避免并发修改异常
+        List<String> nodes;
+        if (subName.isEmpty()) {
+            nodes = new ArrayList<>();
+        } else {
+            synchronized (subNodeCache) {
+                List<String> cached = subNodeCache.get(subName);
+                nodes = cached != null ? new ArrayList<>(cached) : new ArrayList<>();
+            }
+        }
 
         List<String> items = new ArrayList<>();
         items.add("（未选择）");
@@ -763,6 +790,8 @@ public class ProxyConfigActivity extends Activity {
         ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
                 android.R.layout.simple_spinner_item, items);
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        // 防止 setAdapter/setSelection 同步触发 onItemSelected → 递归调本方法
+        row.suppressNodeRefresh = true;
         row.nodeSpinner.setAdapter(adapter);
         // 恢复选择
         int sel = 0;
@@ -772,6 +801,7 @@ public class ProxyConfigActivity extends Activity {
             }
         }
         row.nodeSpinner.setSelection(sel);
+        row.suppressNodeRefresh = false;
     }
 
     /**
@@ -1137,43 +1167,62 @@ public class ProxyConfigActivity extends Activity {
     }
 
     private void fetchNodes() {
-        if (!MihomoManager.isRunning()) {
-            runOnUiThread(() -> buildAccountBindings());
-            return;
-        }
-        // 构建订阅名 → providerName 映射（存入字段，测延迟时按订阅隔离）。
-        // 注意：失效订阅的 provider 在 mihomo 中不存在，fetchNodeList 会返回空列表，
-        // 但订阅名仍保留在映射里，UI 仍可选该订阅；已选节点靠 preset 保留机制不丢失。
-        subNameToProvider.clear();
-        JSONArray subs = mihomoConfig.optJSONArray("subscriptions");
-        if (subs != null) {
-            for (int i = 0; i < subs.length(); i++) {
-                JSONObject s = subs.optJSONObject(i);
-                if (s == null) continue;
-                String name = s.optString("name", "订阅" + (i + 1));
-                String providerName = "sub-" + i;
-                subNameToProvider.put(name, providerName);
+        // 并发保护：onCreate 与 onResume 可能同时触发，避免两个线程并发 clear/put 缓存
+        // 导致 LinkedHashMap 内部链表损坏（ConcurrentModificationException）→ 进程崩溃且无日志
+        if (fetchNodesRunning) return;
+        fetchNodesRunning = true;
+        try {
+            if (!MihomoManager.isRunning()) {
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    try { buildAccountBindings(); } catch (Throwable t) {
+                        android.util.Log.e("ProxyConfig", "重建绑定区失败", t);
+                    }
+                });
+                return;
             }
-        }
-
-        subNodeCache.clear();
-        for (String subName : subNameToProvider.keySet()) {
-            String providerName = subNameToProvider.get(subName);
-            // provider 不存在（订阅失效）时返回空列表，不抛异常
-            List<String> nodes = MihomoManager.fetchNodeList(providerName);
-            subNodeCache.put(subName, nodes);
-        }
-
-        runOnUiThread(() -> {
-            if (isFinishing()) return;
-            // 重建绑定区：已选节点靠 preset 保留机制恢复（即使订阅暂时失效也不丢失）
-            try {
-                buildAccountBindings();
-            } catch (Throwable t) {
-                android.util.Log.e("ProxyConfig", "重建绑定区失败", t);
-                toast("加载节点绑定失败: " + t.getMessage());
+            // 构建订阅名 → providerName 映射。先构建到局部临时 Map，再整体替换字段，
+            // 缩短字段被锁的时间，减少与主线程读的竞争。
+            java.util.Map<String, String> tmpMap = new java.util.LinkedHashMap<>();
+            JSONArray subs = mihomoConfig.optJSONArray("subscriptions");
+            if (subs != null) {
+                for (int i = 0; i < subs.length(); i++) {
+                    JSONObject s = subs.optJSONObject(i);
+                    if (s == null) continue;
+                    String name = s.optString("name", "订阅" + (i + 1));
+                    tmpMap.put(name, "sub-" + i);
+                }
             }
-        });
+            // 拉取每个订阅的节点列表到临时 Map
+            java.util.Map<String, List<String>> tmpCache = new java.util.LinkedHashMap<>();
+            for (java.util.Map.Entry<String, String> e : tmpMap.entrySet()) {
+                // provider 不存在（订阅失效）时返回空列表，不抛异常
+                List<String> nodes = MihomoManager.fetchNodeList(e.getValue());
+                tmpCache.put(e.getKey(), nodes);
+            }
+            // 整体替换字段（synchronizedMap 自带同步）
+            subNameToProvider.clear();
+            subNameToProvider.putAll(tmpMap);
+            subNodeCache.clear();
+            subNodeCache.putAll(tmpCache);
+
+            runOnUiThread(() -> {
+                if (isFinishing()) return;
+                // 重建绑定区：已选节点靠 preset 保留机制恢复（即使订阅暂时失效也不丢失）
+                try {
+                    buildAccountBindings();
+                } catch (Throwable t) {
+                    android.util.Log.e("ProxyConfig", "重建绑定区失败", t);
+                    toast("加载节点绑定失败: " + t.getMessage());
+                }
+            });
+        } catch (Throwable t) {
+            // 后台线程未捕获异常会导致整个进程崩溃且无应用日志，必须兜住
+            android.util.Log.e("ProxyConfig", "fetchNodes 失败", t);
+            LogStore.get().log("UI", "拉取节点失败: " + t.getMessage());
+        } finally {
+            fetchNodesRunning = false;
+        }
     }
 
     // ========== 工具 ==========

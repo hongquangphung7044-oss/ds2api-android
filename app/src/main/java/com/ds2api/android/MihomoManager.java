@@ -610,25 +610,31 @@ public final class MihomoManager {
      * 成功写入 outFile（原子写），失败返回 false。
      */
     static boolean downloadSubscription(String url, File outFile, String subName) {
-        // 常见 clash 客户端 UA，按优先级尝试。机场通常根据 UA 返回不同格式/拦截。
+        // UA 策略：先试 clash/mihomo 客户端 UA（机场会返回原生 clash YAML，最佳），
+        // 再试标准浏览器 UA（部分机场对 clash UA 返回 403，但对浏览器 UA 放行 base64 订阅，
+        // mihomo 内核原生支持解析 base64 编码的 share link 订阅）。
         String[] uas = new String[]{
-                "clash-verge/v2.0.3",
+                "clash-verge/v2.2.0",
                 "ClashMetaForAndroid/2.10.4",
-                "clash-verge/v1.7.7",
-                "ClashforWindows/0.20.39",
+                "clash.meta",
                 "mihomo/v1.19.0",
-                "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Clash"
+                "ClashforWindows/0.20.39",
+                "clash-verge/v1.7.7",
+                "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         };
         for (String ua : uas) {
             try {
                 byte[] data = httpDownload(url, ua, 15000);
                 if (data == null || data.length == 0) continue;
                 String body = new String(data, StandardCharsets.UTF_8);
-                // 基本校验：clash 订阅至少含 proxies 或 proxy-providers
-                if (!body.contains("proxies:") && !body.contains("proxy-providers:")
-                        && !body.contains("\"proxies\"")) {
+                // 格式校验：mihomo proxy-provider 支持三种格式——
+                // 1. clash YAML（含 proxies:/proxy-providers:）
+                // 2. base64 编码的 share link 列表（解码后含 ss:// vmess:// trojan:// 等）
+                // 3. 明文 share link 列表（直接含 ss:// vmess:// 等）
+                if (!isValidSubscriptionContent(body)) {
                     LogStore.get().log(TAG, "订阅 [" + subName + "] UA=" + ua
-                            + " 返回内容非 clash 格式（前80字符: "
+                            + " 返回内容非订阅格式（前80字符: "
                             + body.substring(0, Math.min(80, body.length())).replace("\n", " ")
                             + "），尝试下一个 UA");
                     continue;
@@ -655,6 +661,38 @@ public final class MihomoManager {
             }
         }
         return false;
+    }
+
+    /**
+     * 校验订阅内容是否可被 mihomo 解析。支持三种格式：
+     * 1. clash YAML（含 proxies: 或 proxy-providers:）
+     * 2. base64 编码的 share link 列表（解码后含协议头）
+     * 3. 明文 share link 列表（直接含 ss:// vmess:// trojan:// vless:// hysteria2:// 等）
+     */
+    private static boolean isValidSubscriptionContent(String body) {
+        if (body == null || body.isEmpty()) return false;
+        // 1. clash YAML 格式
+        if (body.contains("proxies:") || body.contains("proxy-providers:")
+                || body.contains("\"proxies\"")) {
+            return true;
+        }
+        // 3. 明文 share link
+        if (body.contains("ss://") || body.contains("vmess://") || body.contains("trojan://")
+                || body.contains("vless://") || body.contains("hysteria") || body.contains("tuic://")) {
+            return true;
+        }
+        // 2. base64 编码：尝试解码看是否含 share link
+        try {
+            String trimmed = body.trim().replaceAll("\\s+", "");
+            byte[] decoded = java.util.Base64.getDecoder().decode(trimmed);
+            String decodedStr = new String(decoded, StandardCharsets.UTF_8);
+            return decodedStr.contains("ss://") || decodedStr.contains("vmess://")
+                    || decodedStr.contains("trojan://") || decodedStr.contains("vless://")
+                    || decodedStr.contains("hysteria") || decodedStr.contains("tuic://");
+        } catch (Throwable ignored) {
+            // 非 base64，也不是已知格式
+            return false;
+        }
     }
 
     /** HTTP GET 下载，跟随重定向，返回字节数组。 */
