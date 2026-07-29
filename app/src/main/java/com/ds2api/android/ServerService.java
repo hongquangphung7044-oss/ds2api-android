@@ -614,7 +614,15 @@ public class ServerService extends Service {
                 wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ds2api:server");
                 wakeLock.setReferenceCounted(false);
             }
-            wakeLock.acquire(12 * 60 * 60 * 1000L);
+            // 只短暂持有 30 秒，确保进程启动 + 就绪探测期间 CPU 不休眠。
+            // 服务运行期间靠前台服务（startForeground）保活，不再长期持锁，
+            // 让 CPU 可正常休眠省电。请求到来时内核会唤醒 socket，无需 WakeLock。
+            wakeLock.acquire(30 * 1000L);
+            // 30 秒后自动释放
+            new Thread(() -> {
+                try { Thread.sleep(31 * 1000L); } catch (InterruptedException ignored) {}
+                releaseWakeLock();
+            }, "wakeLock-release").start();
         } catch (Throwable t) {
             LogStore.get().log("APP", "WakeLock 获取失败: " + t.getMessage());
         }

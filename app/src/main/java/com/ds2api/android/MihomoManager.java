@@ -830,24 +830,32 @@ public final class MihomoManager {
 
         // 2. 对每个 provider 触发 healthcheck（内核批量测延迟）
         for (String pn : providerNames) {
-            // healthcheck: GET /providers/proxies/{name}/healthcheck
             apiGet("/providers/proxies/" + pn + "/healthcheck");
         }
 
-        // 3. 轮询等待内核完成 healthcheck（异步执行，需等 history 写入）
-        // 最多等 20 秒，每 1 秒检查一次，一旦有节点出现 delay 就可以提前读
-        try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+        // 3. 轮询等待 healthcheck 完成：每 800ms 检查一次，
+        // 当超过 90% 节点有 history 或达到上限 12s 即结束。
+        long deadline = System.currentTimeMillis() + 12000;
         int totalNodes = 0;
-        for (String pn : providerNames) {
-            JSONObject resp = apiGet("/providers/proxies/" + pn);
-            if (resp == null) continue;
-            JSONArray proxies = resp.optJSONArray("proxies");
-            if (proxies == null) continue;
-            totalNodes += proxies.length();
+        while (System.currentTimeMillis() < deadline) {
+            totalNodes = 0;
+            int tested = 0;
+            for (String pn : providerNames) {
+                JSONObject resp = apiGet("/providers/proxies/" + pn);
+                if (resp == null) continue;
+                JSONArray proxies = resp.optJSONArray("proxies");
+                if (proxies == null) continue;
+                for (int i = 0; i < proxies.length(); i++) {
+                    JSONObject node = proxies.optJSONObject(i);
+                    if (node == null) continue;
+                    totalNodes++;
+                    JSONArray h = node.optJSONArray("history");
+                    if (h != null && h.length() > 0) tested++;
+                }
+            }
+            if (totalNodes > 0 && tested >= totalNodes * 0.9) break;
+            try { Thread.sleep(800); } catch (InterruptedException ignored) { break; }
         }
-        // 如果节点多，多等一会
-        int waitMs = Math.min(15000, 2000 + totalNodes * 100);
-        try { Thread.sleep(waitMs); } catch (InterruptedException ignored) {}
 
         // 4. 读每个 provider 的节点 history 汇总延迟
         int total = 0, ok = 0;

@@ -576,7 +576,7 @@ public class ProxyConfigActivity extends Activity {
         btnRow.addView(addBtn, new LinearLayout.LayoutParams(-2, dp(38)));
 
         Button testBtn = makeSecondaryButton("测试延迟", v -> {});
-        testBtn.setOnClickListener(v -> doTestDelay(spinners, delayLabels, testBtn, subSpinner));
+        testBtn.setOnClickListener(v -> doTestDelay(spinners, delayLabels, testBtn, subSpinner, card));
         btnRow.addView(testBtn, new LinearLayout.LayoutParams(-2, dp(38)));
 
         Button verifyBtn = makeSecondaryButton("验证代理", v -> doVerifyProxy(accIndex, verifyLabel));
@@ -584,6 +584,24 @@ public class ProxyConfigActivity extends Activity {
 
         card.addView(btnRow);
         card.addView(verifyLabel);
+
+        // 全节点延迟列表区域（测延迟后显示所有节点+延迟，可滚动）
+        ScrollView delayListScroll = new ScrollView(this);
+        LinearLayout.LayoutParams dlsLp = new LinearLayout.LayoutParams(-1, dp(180));
+        dlsLp.topMargin = dp(6);
+        delayListScroll.setLayoutParams(dlsLp);
+        delayListScroll.setBackgroundColor(Color.parseColor("#F8FAFC"));
+        delayListScroll.setVisibility(View.GONE); // 默认隐藏，测延迟后显示
+        TextView delayListText = new TextView(this);
+        delayListText.setTextSize(11);
+        delayListText.setTypeface(Typeface.MONOSPACE);
+        delayListText.setPadding(dp(8), dp(8), dp(8), dp(8));
+        delayListText.setTextColor(Color.parseColor(COLOR_TEXT));
+        delayListScroll.addView(delayListText);
+        card.addView(delayListScroll);
+        // 保存引用供 doTestDelay 使用（通过 card 的 tag）
+        card.setTag(R.id.text1, delayListScroll);
+        card.setTag(R.id.text2, delayListText);
 
         return card;
     }
@@ -699,7 +717,7 @@ public class ProxyConfigActivity extends Activity {
      * 然后更新已选节点行的延迟徽章。
      */
     private void doTestDelay(List<Spinner> spinners, List<TextView> delayLabels,
-                             Button testBtn, Spinner subSpinner) {
+                             Button testBtn, Spinner subSpinner, LinearLayout card) {
         if (!MihomoManager.isRunning()) {
             toast("请先启动 mihomo");
             return;
@@ -768,6 +786,34 @@ public class ProxyConfigActivity extends Activity {
                 }
                 LogStore.get().log("UI", "延迟徽章更新完成，匹配 " + matched + "/" + spinners.size()
                         + " 个已选节点");
+            }
+            // 填充全节点延迟列表（按延迟升序，不可用节点排最后）
+            if (!delayMap.isEmpty() && card != null) {
+                Object scrollObj = card.getTag(R.id.text1);
+                Object textObj = card.getTag(R.id.text2);
+                if (scrollObj instanceof ScrollView && textObj instanceof TextView) {
+                    ScrollView delayListScroll = (ScrollView) scrollObj;
+                    TextView delayListText = (TextView) textObj;
+                    // 排序：可用节点按延迟升序，不可用节点排后
+                    List<java.util.Map.Entry<String, Integer>> sorted = new ArrayList<>(delayMap.entrySet());
+                    java.util.Collections.sort(sorted, (a, b) -> {
+                        int da = a.getValue(), db = b.getValue();
+                        return Integer.compare(da, db);
+                    });
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("节点延迟列表（").append(delayMap.size()).append("可用）\n\n");
+                    for (java.util.Map.Entry<String, Integer> e : sorted) {
+                        int d = e.getValue();
+                        String color = d < 200 ? "●" : (d < 500 ? "●" : "●");
+                        sb.append(color).append(" ")
+                          .append(String.format("%5dms", d)).append("  ")
+                          .append(e.getKey()).append("\n");
+                    }
+                    runOnUiThread(() -> {
+                        delayListText.setText(sb.toString());
+                        delayListScroll.setVisibility(View.VISIBLE);
+                    });
+                }
             }
             runOnUiThread(() -> {
                 testBtn.setEnabled(true);
