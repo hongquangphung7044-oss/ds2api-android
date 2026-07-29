@@ -612,9 +612,8 @@ public class ProxyConfigActivity extends Activity {
         delayListText.setTextColor(Color.parseColor(COLOR_TEXT));
         delayListScroll.addView(delayListText);
         card.addView(delayListScroll);
-        // 保存引用供 doTestDelay 使用（通过 card 的 tag）
-        card.setTag(android.R.id.text1, delayListScroll);
-        card.setTag(android.R.id.text2, delayListText);
+        // 保存引用供 doTestDelay 使用（用包装数组做 tag，避免 setTag(int) 要求 app 资源 ID）
+        card.setTag(new Object[]{delayListScroll, delayListText});
 
         return card;
     }
@@ -802,30 +801,25 @@ public class ProxyConfigActivity extends Activity {
             }
             // 填充全节点延迟列表（按延迟升序，不可用节点排最后）
             if (!delayMap.isEmpty() && card != null) {
-                Object scrollObj = card.getTag(android.R.id.text1);
-                Object textObj = card.getTag(android.R.id.text2);
-                if (scrollObj instanceof ScrollView && textObj instanceof TextView) {
-                    ScrollView delayListScroll = (ScrollView) scrollObj;
-                    TextView delayListText = (TextView) textObj;
-                    // 排序：可用节点按延迟升序，不可用节点排后
-                    List<java.util.Map.Entry<String, Integer>> sorted = new ArrayList<>(delayMap.entrySet());
-                    java.util.Collections.sort(sorted, (a, b) -> {
-                        int da = a.getValue(), db = b.getValue();
-                        return Integer.compare(da, db);
-                    });
-                    StringBuilder sb = new StringBuilder();
-                    sb.append("节点延迟列表（").append(delayMap.size()).append("可用）\n\n");
-                    for (java.util.Map.Entry<String, Integer> e : sorted) {
-                        int d = e.getValue();
-                        String color = d < 200 ? "●" : (d < 500 ? "●" : "●");
-                        sb.append(color).append(" ")
-                          .append(String.format("%5dms", d)).append("  ")
-                          .append(e.getKey()).append("\n");
+                Object tag = card.getTag();
+                if (tag instanceof Object[]) {
+                    Object[] arr = (Object[]) tag;
+                    if (arr.length >= 2 && arr[0] instanceof ScrollView && arr[1] instanceof TextView) {
+                        final ScrollView delayListScroll = (ScrollView) arr[0];
+                        final TextView delayListText = (TextView) arr[1];
+                        List<java.util.Map.Entry<String, Integer>> sorted = new ArrayList<>(delayMap.entrySet());
+                        java.util.Collections.sort(sorted, (a, b) -> Integer.compare(a.getValue(), b.getValue()));
+                        StringBuilder sb = new StringBuilder();
+                        sb.append("节点延迟列表（").append(delayMap.size()).append("可用）\n\n");
+                        for (java.util.Map.Entry<String, Integer> e : sorted) {
+                            sb.append("● ").append(String.format("%5dms", e.getValue()))
+                              .append("  ").append(e.getKey()).append("\n");
+                        }
+                        runOnUiThread(() -> {
+                            delayListText.setText(sb.toString());
+                            delayListScroll.setVisibility(View.VISIBLE);
+                        });
                     }
-                    runOnUiThread(() -> {
-                        delayListText.setText(sb.toString());
-                        delayListScroll.setVisibility(View.VISIBLE);
-                    });
                 }
             }
             runOnUiThread(() -> {
