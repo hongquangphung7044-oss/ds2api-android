@@ -269,13 +269,40 @@ public final class MihomoManager {
 
     /** 切换 selector group 的当前节点。 */
     static boolean switchNode(String groupName, String nodeName) {
+        HttpURLConnection c = null;
         try {
             JSONObject body = new JSONObject();
             body.put("name", nodeName);
-            return apiPut("/proxies/" + groupName, body.toString());
-        } catch (Throwable t) {
-            LogStore.get().log(TAG, "切换节点失败: " + t.getMessage());
+            byte[] bodyBytes = body.toString().getBytes(StandardCharsets.UTF_8);
+            java.net.URI uri = new java.net.URI("http", null, "127.0.0.1", apiPort,
+                    "/proxies/" + groupName, null, null);
+            c = (HttpURLConnection) uri.toURL().openConnection(java.net.Proxy.NO_PROXY);
+            c.setConnectTimeout(3000);
+            c.setReadTimeout(5000);
+            c.setRequestMethod("PUT");
+            c.setDoOutput(true);
+            c.setRequestProperty("Content-Type", "application/json");
+            if (!apiSecret.isEmpty()) {
+                c.setRequestProperty("Authorization", "Bearer " + apiSecret);
+            }
+            try (OutputStream os = c.getOutputStream()) {
+                os.write(bodyBytes);
+            }
+            int code = c.getResponseCode();
+            if (code >= 200 && code < 300) return true;
+            // 读取错误信息
+            InputStream err = c.getErrorStream();
+            if (err != null) {
+                byte[] data = readAll(err);
+                LogStore.get().log(TAG, "切换节点失败 [" + groupName + " → " + nodeName
+                        + "] HTTP " + code + ": " + new String(data, StandardCharsets.UTF_8));
+            }
             return false;
+        } catch (Throwable t) {
+            LogStore.get().log(TAG, "切换节点异常: " + t.getMessage());
+            return false;
+        } finally {
+            if (c != null) c.disconnect();
         }
     }
 
@@ -509,6 +536,7 @@ public final class MihomoManager {
 
     /**
      * 测试单个节点到 chat.deepseek.com 的延迟。
+     * 节点来自 proxy-provider，会出现在 /proxies 全局映射中（被 group use 引用后）。
      * @param nodeName 节点名（mihomo 代理名）
      * @return 延迟毫秒数，-1 表示失败/超时
      */
@@ -516,10 +544,11 @@ public final class MihomoManager {
         if (!isRunning()) return -1;
         HttpURLConnection c = null;
         try {
-            // URLEncoder.encode 把空格编码为 +，但 URL 路径段中 + 是字面量，需替换为 %20
-            String encoded = java.net.URLEncoder.encode(nodeName, "UTF-8").replace("+", "%20");
-            String path = "/proxies/" + encoded + "/delay?url=https%3A%2F%2Fchat.deepseek.com%2F&timeout=5000";
-            URL url = new URL("http://127.0.0.1:" + apiPort + path);
+            // 用 URI 构造，自动处理路径段编码，避免 URLEncoder 把空格变 + 的问题
+            java.net.URI uri = new java.net.URI("http", null, "127.0.0.1", apiPort,
+                    "/proxies/" + nodeName + "/delay",
+                    "url=https%3A%2F%2Fchat.deepseek.com%2F&timeout=5000", null);
+            URL url = uri.toURL();
             c = (HttpURLConnection) url.openConnection(java.net.Proxy.NO_PROXY);
             c.setConnectTimeout(3000);
             c.setReadTimeout(8000);  // 必须大于 delay timeout(5s)，否则 HTTP 先超时
@@ -529,14 +558,12 @@ public final class MihomoManager {
             }
             int code = c.getResponseCode();
             // mihomo 延迟测试：成功返回 200 {"delay": N}，失败返回 400+ {"message": "..."}
-            // 两种情况都要读 body
             InputStream stream = (code >= 200 && code < 300) ? c.getInputStream() : c.getErrorStream();
             if (stream == null) return -1;
             byte[] data = readAll(stream);
             JSONObject resp = new JSONObject(new String(data, StandardCharsets.UTF_8));
             int delay = resp.optInt("delay", -1);
             if (delay > 0) return delay;
-            // 非 200 时记录原因，方便排查
             if (code != 200) {
                 LogStore.get().log(TAG, "延迟测试 [" + nodeName + "] HTTP " + code
                         + ": " + resp.optString("message", ""));
@@ -548,6 +575,88 @@ public final class MihomoManager {
         } finally {
             if (c != null) c.disconnect();
         }
+    }
+
+    /**
+     * 从 /proxies 读取所有节点的当前延迟（来自 health-check 历史）。
+     * 返回 节点名 → 延迟ms 的映射，未测过的节点不含 delay 或为 0。
+     */
+    static java.util.Map<String, Integer> fetchAllDelays() {
+        java.util.Map<String, Integer> map = new java.util.HashMap<>();
+        if (!isRunning()) return map;
+        JSONObject resp = apiGet("/proxies");
+        if (resp == null) return map;
+        JSONObject proxies = resp.optJSONObject("proxies");
+        if (proxies == null) return map;
+        JSONArray names = proxies.names();
+        if (names == null) return map;
+        for (int i = 0; i < names.length(); i++) {
+            String name = names.optString(i);
+            JSONObject p = proxies.optJSONObject(name);
+            if (p == null) continue;
+            String type = p.optString("type", "");
+            // 只关心实际代理节点，跳过策略组（Selector/URLTest/Fallback/LoadBalance/DIRECT/REJECT）
+            if ("Selector".equals(type) || "URLTest".equals(type)
+                    || "Fallback".equals(type) || "LoadBalance".equals(type)
+                    || "DIRECT".equals(type) || "REJECT".equals(type)
+                    || "Compatible".equals(type)) {
+                continue;
+            }
+            JSONArray history = p.optJSONArray("history");
+            if (history != null && history.length() > 0) {
+                JSONObject last = history.optJSONObject(history.length() - 1);
+                if (last != null) {
+                    int delay = last.optInt("delay", 0);
+                    map.put(name, delay);
+                }
+            }
+        }
+        return map;
+    }
+
+    /**
+     * 对策略组内所有节点执行延迟测试（用 group delay API）。
+     * 这会触发 mihomo 对该组 use 的所有 provider 节点进行批量延迟测试。
+     * @param groupName 策略组名
+     * @return 节点名 → 延迟ms 的映射
+     */
+    static java.util.Map<String, Integer> testGroupDelay(String groupName) {
+        java.util.Map<String, Integer> map = new java.util.HashMap<>();
+        if (!isRunning()) return map;
+        try {
+            java.net.URI uri = new java.net.URI("http", null, "127.0.0.1", apiPort,
+                    "/group/" + groupName + "/delay",
+                    "url=https%3A%2F%2Fchat.deepseek.com%2F&timeout=5000", null);
+            HttpURLConnection c = (HttpURLConnection) uri.toURL().openConnection(java.net.Proxy.NO_PROXY);
+            c.setConnectTimeout(3000);
+            c.setReadTimeout(30000);  // 批量测试需要更长时间
+            c.setRequestMethod("GET");
+            if (!apiSecret.isEmpty()) {
+                c.setRequestProperty("Authorization", "Bearer " + apiSecret);
+            }
+            int code = c.getResponseCode();
+            InputStream stream = (code >= 200 && code < 300) ? c.getInputStream() : c.getErrorStream();
+            if (stream == null) { c.disconnect(); return map; }
+            byte[] data = readAll(stream);
+            c.disconnect();
+            if (code != 200) {
+                LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] HTTP " + code
+                        + ": " + new String(data, StandardCharsets.UTF_8));
+                return map;
+            }
+            JSONObject resp = new JSONObject(new String(data, StandardCharsets.UTF_8));
+            // 返回格式: {"节点名": 延迟ms, ...}，失败的节点延迟为0或不含
+            JSONArray keys = resp.names();
+            if (keys == null) return map;
+            for (int i = 0; i < keys.length(); i++) {
+                String name = keys.optString(i);
+                int delay = resp.optInt(name, 0);
+                if (delay > 0) map.put(name, delay);
+            }
+        } catch (Throwable t) {
+            LogStore.get().log(TAG, "组延迟测试失败 [" + groupName + "]: " + t.getMessage());
+        }
+        return map;
     }
 
     private static boolean apiPut(String path, String body) {

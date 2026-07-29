@@ -191,6 +191,9 @@ public class ProxyConfigActivity extends Activity {
         mihomoStatusLabel.setTextSize(13);
         statusRow.addView(mihomoStatusLabel, new LinearLayout.LayoutParams(0, -2, 1f));
 
+        Button refreshSubBtn = makeSecondaryButton("更新订阅", v -> doRefresh());
+        statusRow.addView(refreshSubBtn, new LinearLayout.LayoutParams(-2, dp(40)));
+
         startMihomoBtn = makePrimaryButton("启动 mihomo", v -> doStartMihomo());
         stopMihomoBtn = makeSecondaryButton("停止", v -> doStopMihomo());
         statusRow.addView(startMihomoBtn, new LinearLayout.LayoutParams(-2, dp(40)));
@@ -477,7 +480,6 @@ public class ProxyConfigActivity extends Activity {
                 android.R.layout.simple_spinner_item, subOptions);
         subAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         subSpinner.setAdapter(subAdapter);
-        // 选中预设值
         if (!presetSubName.isEmpty()) {
             for (int k = 0; k < subOptions.size(); k++) {
                 if (subOptions.get(k).equals(presetSubName)) {
@@ -513,7 +515,7 @@ public class ProxyConfigActivity extends Activity {
             card.addView(buildNodeRow(spinners, delayLabels, n, preset, card));
         }
 
-        // 按钮行：添加备用节点 + 测试延迟
+        // 按钮行：添加备用节点 + 测试全部延迟
         LinearLayout btnRow = new LinearLayout(this);
         btnRow.setOrientation(LinearLayout.HORIZONTAL);
         btnRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -527,8 +529,8 @@ public class ProxyConfigActivity extends Activity {
         });
         btnRow.addView(addBtn, new LinearLayout.LayoutParams(-2, dp(38)));
 
-        Button testBtn = makeSecondaryButton("测试延迟", v -> {});
-        testBtn.setOnClickListener(v -> doTestDelay(spinners, delayLabels, testBtn));
+        Button testBtn = makeSecondaryButton("测试全部延迟", v -> {});
+        testBtn.setOnClickListener(v -> doTestDelay(spinners, delayLabels, testBtn, subSpinner));
         btnRow.addView(testBtn, new LinearLayout.LayoutParams(-2, dp(38)));
 
         card.addView(btnRow);
@@ -642,12 +644,30 @@ public class ProxyConfigActivity extends Activity {
         return container;
     }
 
-    /** 测试该账号绑定的所有节点延迟。 */
-    private void doTestDelay(List<Spinner> spinners, List<TextView> delayLabels, Button testBtn) {
+    /**
+     * 测试该账号所选订阅的全部节点延迟（用 group delay API 批量测试），
+     * 然后更新已选节点行的延迟徽章。
+     */
+    private void doTestDelay(List<Spinner> spinners, List<TextView> delayLabels,
+                             Button testBtn, Spinner subSpinner) {
         if (!MihomoManager.isRunning()) {
             toast("请先启动 mihomo");
             return;
         }
+        // 获取该账号选中的订阅
+        String subName = "";
+        if (subSpinner.getSelectedItemPosition() > 0) {
+            subName = subSpinner.getSelectedItem().toString();
+        }
+        if (subName.isEmpty()) {
+            toast("请先选择订阅");
+            return;
+        }
+
+        // 找到该订阅对应的 group 名（acc-{index}）
+        int accIdx = accountSubSpinners.indexOf(subSpinner);
+        String groupName = "acc-" + accIdx;
+
         testBtn.setEnabled(false);
         testBtn.setText("测试中...");
         // 先重置所有徽章
@@ -656,44 +676,66 @@ public class ProxyConfigActivity extends Activity {
             l.setTextColor(Color.parseColor(COLOR_GRAY));
             l.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
         }
+
         new Thread(() -> {
-            for (int i = 0; i < spinners.size(); i++) {
-                Spinner s = spinners.get(i);
-                if (i >= delayLabels.size()) break;
-                TextView label = delayLabels.get(i);
-                Object sel = s.getSelectedItem();
-                if (sel == null) {
-                    runOnUiThread(() -> label.setText("—"));
-                    continue;
+            // 用 group delay API 批量测试该组所有节点
+            java.util.Map<String, Integer> delayMap = MihomoManager.testGroupDelay(groupName);
+            // 如果 group API 不可用，回退到逐个测试已选节点
+            if (delayMap.isEmpty()) {
+                for (int i = 0; i < spinners.size(); i++) {
+                    Spinner s = spinners.get(i);
+                    if (i >= delayLabels.size()) break;
+                    TextView label = delayLabels.get(i);
+                    Object sel = s.getSelectedItem();
+                    if (sel == null) { continue; }
+                    String nodeName = sel.toString();
+                    if ("（未选择）".equals(nodeName) || nodeName.isEmpty()) { continue; }
+                    int delay = MihomoManager.testNodeDelay(nodeName);
+                    int finalI = i;
+                    runOnUiThread(() -> updateDelayBadge(delayLabels.get(finalI), delay));
                 }
-                String nodeName = sel.toString();
-                if ("（未选择）".equals(nodeName) || nodeName.isEmpty()) {
-                    runOnUiThread(() -> label.setText("—"));
-                    continue;
-                }
-                int delay = MihomoManager.testNodeDelay(nodeName);
-                runOnUiThread(() -> {
-                    if (delay > 0) {
-                        label.setText(delay + "ms");
-                        if (delay < 300) {
-                            label.setTextColor(Color.parseColor(COLOR_GREEN));
-                            label.setBackground(roundedBackground("#DCFCE7", "#BBF7D0", dp(10)));
-                        } else {
-                            label.setTextColor(Color.parseColor("#B45309"));
-                            label.setBackground(roundedBackground("#FEF3C7", "#FDE68A", dp(10)));
-                        }
-                    } else {
-                        label.setText("超时");
-                        label.setTextColor(Color.parseColor(COLOR_RED));
-                        label.setBackground(roundedBackground("#FEE2E2", "#FECACA", dp(10)));
+            } else {
+                // 更新已选节点的延迟徽章
+                for (int i = 0; i < spinners.size(); i++) {
+                    Spinner s = spinners.get(i);
+                    if (i >= delayLabels.size()) break;
+                    TextView label = delayLabels.get(i);
+                    Object sel = s.getSelectedItem();
+                    if (sel == null) { continue; }
+                    String nodeName = sel.toString();
+                    if ("（未选择）".equals(nodeName) || nodeName.isEmpty()) {
+                        runOnUiThread(() -> label.setText("—"));
+                        continue;
                     }
-                });
+                    Integer delay = delayMap.get(nodeName);
+                    int finalI = i;
+                    runOnUiThread(() -> updateDelayBadge(delayLabels.get(finalI),
+                            delay != null ? delay : -1));
+                }
             }
             runOnUiThread(() -> {
                 testBtn.setEnabled(true);
-                testBtn.setText("测试延迟");
+                testBtn.setText("测试全部延迟");
             });
         }, "delay-test").start();
+    }
+
+    /** 更新延迟徽章显示。 */
+    private void updateDelayBadge(TextView label, int delay) {
+        if (delay > 0) {
+            label.setText(delay + "ms");
+            if (delay < 300) {
+                label.setTextColor(Color.parseColor(COLOR_GREEN));
+                label.setBackground(roundedBackground("#DCFCE7", "#BBF7D0", dp(10)));
+            } else {
+                label.setTextColor(Color.parseColor("#B45309"));
+                label.setBackground(roundedBackground("#FEF3C7", "#FDE68A", dp(10)));
+            }
+        } else {
+            label.setText("超时");
+            label.setTextColor(Color.parseColor(COLOR_RED));
+            label.setBackground(roundedBackground("#FEE2E2", "#FECACA", dp(10)));
+        }
     }
 
     private void renumberNodeRows(ViewGroup card, List<Spinner> spinners) {
