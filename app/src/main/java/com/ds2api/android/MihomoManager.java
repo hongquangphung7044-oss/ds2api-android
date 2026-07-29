@@ -100,8 +100,6 @@ public final class MihomoManager {
         }
         workDir = mihomoWorkDir;
         workDir.mkdirs();
-        File providersDir = new File(workDir, "providers");
-        providersDir.mkdirs();
 
         // 解析配置
         enabled = true;
@@ -129,6 +127,20 @@ public final class MihomoManager {
             out.write(yaml.getBytes(StandardCharsets.UTF_8));
         }
         LogStore.get().log(TAG, "配置已写入 " + configFile.getAbsolutePath());
+
+        // App 层下载订阅到 providers/{providerName}.yaml（绕过 mihomo 内置 http provider 的 403）
+        File providersDir = new File(workDir, "providers");
+        providersDir.mkdirs();
+        int okCount = 0;
+        for (Subscription sub : subs) {
+            File subFile = new File(providersDir, sub.providerName + ".yaml");
+            if (downloadSubscription(sub.url, subFile, sub.name)) {
+                okCount++;
+            } else {
+                LogStore.get().log(TAG, "订阅 [" + sub.name + "] 下载失败，该订阅节点将不可用");
+            }
+        }
+        LogStore.get().log(TAG, "订阅下载完成: " + okCount + "/" + subs.size() + " 成功");
 
         // 启动子进程
         String binPath = ensureBinary(ctx);
@@ -228,28 +240,66 @@ public final class MihomoManager {
 
     // ========== mihomo API 封装 ==========
 
-    /** 获取指定订阅 provider 的节点名列表。 */
+    /**
+     * 获取指定订阅 provider 的节点名列表（已过滤广告/伪节点）。
+     * 机场常在订阅里塞广告条目（"🇦🇶 [到期:...]"、"✅中文官网：xxx"），这些不是真实代理，
+     * 不能让用户选作节点。只返回 type 为真实代理类型的节点。
+     */
     static List<String> fetchNodeList(String providerName) {
         List<String> names = new ArrayList<>();
         JSONObject resp = apiGet("/providers/proxies/" + providerName);
         if (resp == null) return names;
         JSONArray proxies = resp.optJSONArray("proxies");
         if (proxies == null) return names;
+        int filtered = 0;
         for (int i = 0; i < proxies.length(); i++) {
             JSONObject node = proxies.optJSONObject(i);
-            if (node != null) {
-                String name = node.optString("name", "");
-                if (!name.isEmpty()) {
-                    names.add(name);
-                }
+            if (node == null) continue;
+            String name = node.optString("name", "");
+            if (name.isEmpty()) continue;
+            String type = node.optString("type", "");
+            if (isRealProxyType(type)) {
+                names.add(name);
+            } else {
+                filtered++;
             }
+        }
+        if (filtered > 0) {
+            LogStore.get().log(TAG, "订阅 [" + providerName + "] 过滤 " + filtered
+                    + " 个广告/伪节点，保留 " + names.size() + " 个真实节点");
         }
         return names;
     }
 
-    /** 强制刷新指定订阅 provider。 */
+    /** 强制刷新指定订阅 provider（file 类型 provider 不支持 API 刷新，返回 false）。 */
     static boolean refreshSubscription(String providerName) {
+        // file 类型 provider 无法通过 API 重新拉取，需 App 层重新下载订阅文件后 reload
         return apiPut("/providers/proxies/" + providerName, null);
+    }
+
+    /**
+     * App 层重新下载所有订阅文件到 providers/ 目录，并触发内核热重载。
+     * 用于"更新订阅"按钮：file provider 只能通过替换文件 + reload 刷新。
+     * @param config mihomo 配置 JSON（含 subscriptions）
+     * @return 成功下载的订阅数
+     */
+    static int redownloadAllSubscriptions(JSONObject config) {
+        if (workDir == null) return 0;
+        List<Subscription> subs = parseSubscriptions(config);
+        File providersDir = new File(workDir, "providers");
+        providersDir.mkdirs();
+        int ok = 0;
+        for (Subscription sub : subs) {
+            File subFile = new File(providersDir, sub.providerName + ".yaml");
+            if (downloadSubscription(sub.url, subFile, sub.name)) {
+                ok++;
+            }
+        }
+        LogStore.get().log(TAG, "重新下载订阅: " + ok + "/" + subs.size() + " 成功");
+        if (ok > 0) {
+            reloadConfig();
+        }
+        return ok;
     }
 
     /** 获取所有已配置订阅的 provider 名列表。 */
@@ -366,18 +416,14 @@ public final class MihomoManager {
         sb.append("secret: '").append(escapeYamlSingle(secret)).append("'\n\n");
 
         // 多订阅源
-        // 注意：多数机场会拦截 mihomo 默认 User-Agent（返回 403/Forbidden），
-        // 这里显式设置常见 clash 客户端 UA，避免订阅拉取被拦。
+        // 关键：用 type: file，订阅文件由 App 层（downloadSubscription）下载。
+        // 借鉴 FlClash：App 层下载能自由控制 UA/重试/超时，绕过机场对 mihomo
+        // 内置 http provider 的 UA 拦截（很多机场对 mihomo/clash 默认 UA 返回 403）。
         sb.append("proxy-providers:\n");
         for (Subscription sub : subs) {
             sb.append("  ").append(sub.providerName).append(":\n");
-            sb.append("    type: http\n");
-            sb.append("    url: '").append(escapeYamlSingle(sub.url)).append("'\n");
-            sb.append("    interval: ").append(updateInterval).append("\n");
+            sb.append("    type: file\n");
             sb.append("    path: ./providers/").append(sub.providerName).append(".yaml\n");
-            sb.append("    header:\n");
-            sb.append("      User-Agent:\n");
-            sb.append("        - 'clash.meta/v1.18.0'\n");
             sb.append("    health-check:\n");
             sb.append("      enable: true\n");
             sb.append("      url: http://www.gstatic.com/generate_204\n");
@@ -437,6 +483,87 @@ public final class MihomoManager {
             }
         } catch (Throwable t) {
             return null;
+        } finally {
+            if (c != null) c.disconnect();
+        }
+    }
+
+    /**
+     * App 层下载机场订阅到本地文件（借鉴 FlClash：由 App 自己下载，而非依赖内核 http provider）。
+     * 用多个常见 clash 客户端 UA 依次尝试，绕过机场对特定 UA 的 403 拦截。
+     * 成功写入 outFile（原子写），失败返回 false。
+     */
+    static boolean downloadSubscription(String url, File outFile, String subName) {
+        // 常见 clash 客户端 UA，按优先级尝试。机场通常根据 UA 返回不同格式/拦截。
+        String[] uas = new String[]{
+                "clash-verge/v2.0.3",
+                "ClashMetaForAndroid/2.10.4",
+                "clash-verge/v1.7.7",
+                "ClashforWindows/0.20.39",
+                "mihomo/v1.19.0",
+                "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Clash"
+        };
+        for (String ua : uas) {
+            try {
+                byte[] data = httpDownload(url, ua, 15000);
+                if (data == null || data.length == 0) continue;
+                String body = new String(data, StandardCharsets.UTF_8);
+                // 基本校验：clash 订阅至少含 proxies 或 proxy-providers
+                if (!body.contains("proxies:") && !body.contains("proxy-providers:")
+                        && !body.contains("\"proxies\"")) {
+                    LogStore.get().log(TAG, "订阅 [" + subName + "] UA=" + ua
+                            + " 返回内容非 clash 格式（前80字符: "
+                            + body.substring(0, Math.min(80, body.length())).replace("\n", " ")
+                            + "），尝试下一个 UA");
+                    continue;
+                }
+                // 原子写
+                File tmp = new File(outFile.getAbsolutePath() + ".tmp");
+                try (FileOutputStream out = new FileOutputStream(tmp)) {
+                    out.write(data);
+                    out.flush();
+                    try { out.getFD().sync(); } catch (Throwable ignored) {}
+                }
+                if (!tmp.renameTo(outFile)) {
+                    //noinspection ResultOfMethodCallIgnored
+                    outFile.delete();
+                    //noinspection ResultOfMethodCallIgnored
+                    tmp.renameTo(outFile);
+                }
+                LogStore.get().log(TAG, "订阅 [" + subName + "] 下载成功（UA=" + ua
+                        + "，" + data.length + " 字节）");
+                return true;
+            } catch (Throwable t) {
+                LogStore.get().log(TAG, "订阅 [" + subName + "] UA=" + ua
+                        + " 下载失败: " + t.getMessage());
+            }
+        }
+        return false;
+    }
+
+    /** HTTP GET 下载，跟随重定向，返回字节数组。 */
+    private static byte[] httpDownload(String urlStr, String ua, int timeoutMs) throws Exception {
+        HttpURLConnection c = null;
+        try {
+            URL url = new URL(urlStr);
+            c = (HttpURLConnection) url.openConnection(java.net.Proxy.NO_PROXY);
+            c.setConnectTimeout(timeoutMs);
+            c.setReadTimeout(timeoutMs);
+            c.setRequestMethod("GET");
+            c.setRequestProperty("User-Agent", ua);
+            c.setRequestProperty("Accept", "*/*");
+            c.setInstanceFollowRedirects(true);
+            int code = c.getResponseCode();
+            if (code == 200) {
+                try (InputStream in = c.getInputStream()) {
+                    return readAll(in);
+                }
+            }
+            // 非 200：读错误流用于日志
+            InputStream err = c.getErrorStream();
+            String errMsg = err != null ? new String(readAll(err), StandardCharsets.UTF_8) : "";
+            throw new java.io.IOException("HTTP " + code
+                    + (errMsg.length() > 0 ? ": " + errMsg.substring(0, Math.min(120, errMsg.length())) : ""));
         } finally {
             if (c != null) c.disconnect();
         }
@@ -582,11 +709,13 @@ public final class MihomoManager {
         if (!isRunning()) return -1;
         HttpURLConnection c = null;
         try {
-            // 用 URI 构造，自动处理路径段编码，避免 URLEncoder 把空格变 + 的问题
-            java.net.URI uri = new java.net.URI("http", null, "127.0.0.1", apiPort,
-                    "/proxies/" + nodeName + "/delay",
-                    "url=https%3A%2F%2Fchat.deepseek.com%2F&timeout=5000", null);
-            URL url = uri.toURL();
+            // 节点名可能含中文/emoji/空格/方括号，必须做百分号编码后拼路径。
+            // 注意：URLEncoder 会把空格编成 +，path 段需用 %20，故替换。
+            String encoded = java.net.URLEncoder.encode(nodeName, "UTF-8").replace("+", "%20");
+            URL url = new URL("http://127.0.0.1:" + apiPort
+                    + "/proxies/" + encoded + "/delay"
+                    + "?url=" + java.net.URLEncoder.encode("https://chat.deepseek.com/", "UTF-8")
+                    + "&timeout=5000");
             c = (HttpURLConnection) url.openConnection(java.net.Proxy.NO_PROXY);
             c.setConnectTimeout(3000);
             c.setReadTimeout(8000);  // 必须大于 delay timeout(5s)，否则 HTTP 先超时
@@ -653,12 +782,11 @@ public final class MihomoManager {
     }
 
     /**
-     * 对策略组内所有节点执行延迟测试。
-     * 注意：mihomo 官方 API 不存在 /group/{name}/delay（会返回 404）。
-     * 正确做法：先 GET /proxies/{groupName} 取得组内节点列表(all)，
-     * 再对每个节点并发调用 /proxies/{nodeName}/delay。
-     * @param groupName 策略组名
-     * @return 节点名 → 延迟ms 的映射（失败的节点不含）
+     * 对策略组内所有真实代理节点执行延迟测试。
+     * 修复：组 all 数组里可能含机场塞的广告伪节点（"🇦🇶 [到期:...]"、"✅中文官网"等），
+     * 这些不是真实 proxy，测延迟必然 404。故先取 /proxies 全局映射，只对 type 为真实
+     * 代理类型(Shadowsocks/VMess/VLESS/Trojan/Hysteria2/TUIC/WireGuard/Http/Socks5/Snell/AnyTLS)
+     * 的节点测延迟，过滤掉伪节点。
      */
     static java.util.Map<String, Integer> testGroupDelay(String groupName) {
         java.util.Map<String, Integer> map = new java.util.HashMap<>();
@@ -672,20 +800,61 @@ public final class MihomoManager {
         }
         JSONArray all = group.optJSONArray("all");
         if (all == null || all.length() == 0) {
-            LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 组内无节点（订阅可能拉取失败，请检查日志中的 403/错误）");
+            LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 组内无节点（订阅可能拉取失败，请检查日志）");
             return map;
         }
 
-        // 2. 并发测试每个节点延迟
-        int n = all.length();
+        // 2. 取 /proxies 全局映射，构建「真实代理节点名 → type」集合
+        java.util.Set<String> realProxyNames = new java.util.HashSet<>();
+        JSONObject proxiesResp = apiGet("/proxies");
+        if (proxiesResp != null) {
+            JSONObject proxies = proxiesResp.optJSONObject("proxies");
+            if (proxies != null) {
+                JSONArray keys = proxies.names();
+                if (keys != null) {
+                    for (int i = 0; i < keys.length(); i++) {
+                        String name = keys.optString(i);
+                        JSONObject p = proxies.optJSONObject(name);
+                        if (p == null) continue;
+                        String type = p.optString("type", "");
+                        // 只保留真实代理节点，排除 Selector/URLTest/DIRECT/REJECT/Compatible 等非代理
+                        if (isRealProxyType(type)) {
+                            realProxyNames.add(name);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. 过滤：只测组内真实代理节点
+        List<String> toTest = new ArrayList<>();
+        int filteredAds = 0;
+        for (int i = 0; i < all.length(); i++) {
+            String nodeName = all.optString(i);
+            if (nodeName == null || nodeName.isEmpty()) continue;
+            if (realProxyNames.isEmpty() || realProxyNames.contains(nodeName)) {
+                toTest.add(nodeName);
+            } else {
+                filteredAds++;
+            }
+        }
+        if (filteredAds > 0) {
+            LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 过滤 " + filteredAds
+                    + " 个广告/伪节点（非真实代理）");
+        }
+        if (toTest.isEmpty()) {
+            LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 组内无真实代理节点（订阅可能拉取失败）");
+            return map;
+        }
+
+        // 4. 并发测试每个真实节点延迟
+        int n = toTest.size();
         java.util.concurrent.ExecutorService pool =
                 java.util.concurrent.Executors.newFixedThreadPool(Math.min(n, 8));
         java.util.concurrent.ConcurrentHashMap<String, Integer> result =
                 new java.util.concurrent.ConcurrentHashMap<>();
         java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(n);
-        for (int i = 0; i < n; i++) {
-            final String nodeName = all.optString(i);
-            if (nodeName == null || nodeName.isEmpty()) { latch.countDown(); continue; }
+        for (String nodeName : toTest) {
             pool.execute(() -> {
                 try {
                     int delay = testNodeDelay(nodeName);
@@ -703,8 +872,34 @@ public final class MihomoManager {
         pool.shutdownNow();
         map.putAll(result);
         LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 完成: "
-                + map.size() + "/" + n + " 个节点可用");
+                + map.size() + "/" + n + " 个真实节点可用");
         return map;
+    }
+
+    /** 判断 mihomo proxy type 是否为真实代理（可测延迟），排除策略组/内置类型。 */
+    private static boolean isRealProxyType(String type) {
+        if (type == null || type.isEmpty()) return false;
+        switch (type) {
+            case "Shadowsocks":
+            case "ShadowsocksR":
+            case "VMess":
+            case "VLESS":
+            case "Trojan":
+            case "Hysteria":
+            case "Hysteria2":
+            case "TUIC":
+            case "WireGuard":
+            case "Http":
+            case "Socks5":
+            case "Snell":
+            case "AnyTLS":
+            case "ShadowTLS":
+            case "SSH":
+            case "Juicity":
+                return true;
+            default:
+                return false;
+        }
     }
 
     private static boolean apiPut(String path, String body) {

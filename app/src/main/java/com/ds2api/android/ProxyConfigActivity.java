@@ -945,19 +945,15 @@ public class ProxyConfigActivity extends Activity {
             toast("请先启动 mihomo");
             return;
         }
+        toast("正在重新下载订阅...");
         new Thread(() -> {
-            // 刷新所有订阅 provider
-            boolean allOk = true;
-            List<String> providers = MihomoManager.fetchAllProviderNames();
-            for (String p : providers) {
-                if (!MihomoManager.refreshSubscription(p)) allOk = false;
-            }
-            if (allOk) {
-                try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
-                fetchNodes();
-            }
-            boolean finalAllOk = allOk;
-            runOnUiThread(() -> toast(finalAllOk ? "订阅已刷新" : "部分刷新失败，请检查日志"));
+            // file provider 无法通过 API 刷新，必须 App 层重新下载订阅文件 + 热重载
+            int ok = MihomoManager.redownloadAllSubscriptions(mihomoConfig);
+            try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
+            fetchNodes();
+            runOnUiThread(() -> toast(ok > 0
+                    ? "订阅已刷新（" + ok + " 个成功）"
+                    : "刷新失败，请检查日志（可能是 UA 被拦）"));
         }, "sub-refresh").start();
     }
 
