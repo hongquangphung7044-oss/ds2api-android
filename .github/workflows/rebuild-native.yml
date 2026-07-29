@@ -5,7 +5,7 @@ on:
     inputs:
       upstream_ref:
         description: '上游 ds2api 分支/tag'
-        default: 'master'
+        default: 'main'
       mihomo_version:
         description: 'mihomo 版本'
         default: 'v1.19.29'

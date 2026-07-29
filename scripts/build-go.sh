@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # 从上游 ds2api 仓库重新构建 Android 原生服务端（libds2api.so）与内置 WebUI 静态资源。
-# 用法: ./scripts/build-go.sh [上游git引用，默认 master]
+# 用法: ./scripts/build-go.sh [上游git引用，默认 main]
 set -euo pipefail
 
-REF="${1:-master}"
+REF="${1:-main}"
 WORKDIR="$(mktemp -d)"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
