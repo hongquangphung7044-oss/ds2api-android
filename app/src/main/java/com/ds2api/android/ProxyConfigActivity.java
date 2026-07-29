@@ -600,8 +600,8 @@ public class ProxyConfigActivity extends Activity {
         delayListScroll.addView(delayListText);
         card.addView(delayListScroll);
         // 保存引用供 doTestDelay 使用（通过 card 的 tag）
-        card.setTag(R.id.text1, delayListScroll);
-        card.setTag(R.id.text2, delayListText);
+        card.setTag(android.R.id.text1, delayListScroll);
+        card.setTag(android.R.id.text2, delayListText);
 
         return card;
     }
@@ -789,8 +789,8 @@ public class ProxyConfigActivity extends Activity {
             }
             // 填充全节点延迟列表（按延迟升序，不可用节点排最后）
             if (!delayMap.isEmpty() && card != null) {
-                Object scrollObj = card.getTag(R.id.text1);
-                Object textObj = card.getTag(R.id.text2);
+                Object scrollObj = card.getTag(android.R.id.text1);
+                Object textObj = card.getTag(android.R.id.text2);
                 if (scrollObj instanceof ScrollView && textObj instanceof TextView) {
                     ScrollView delayListScroll = (ScrollView) scrollObj;
                     TextView delayListText = (TextView) textObj;
