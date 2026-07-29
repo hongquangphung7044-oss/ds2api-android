@@ -125,10 +125,12 @@ App 采用「Java 宿主 + 双子进程」架构：Java 层负责 UI 和协调�
 | 端口 | 用途 | 配置项 |
 |------|------|--------|
 | 5001 | ds2api HTTP API | `ServerService.PORT`（固定） |
-| 9090 | mihomo RESTful API | `mihomo_config.json: api_port` |
-| 7890 | mihomo SOCKS5 入站（账号 0） | `socks5_base_port + 0` |
-| 7891 | mihomo SOCKS5 入站（账号 1） | `socks5_base_port + 1` |
+| 19090 | mihomo RESTful API | `mihomo_config.json: api_port` |
+| 17890 | mihomo SOCKS5 入站（账号 0） | `socks5_base_port + 0` |
+| 17891 | mihomo SOCKS5 入站（账号 1） | `socks5_base_port + 1` |
 | ... | 每账号递增 | `socks5_base_port + N` |
+
+> 端口选高位段（17890/19090）避开 Clash/FlClash 默认的 7890/9090。启动时自动检测占用，被占则递增找可用端口。mihomo 仅监听 `127.0.0.1`，不设系统代理，不影响手机其他代理工具。
 
 ## 配置文件生命周期
 
@@ -172,6 +174,10 @@ fallback 的 filter 正则对含 emoji/中文的节点名匹配不可靠。改�
 ### 为什么配置存独立文件？
 
 ds2api Go 服务端运行时会写回 `config.json`，嵌套的 mihomo 配置段会被覆盖。独立 `mihomo_config.json` 避免此问题。
+
+### 为什么用高位端口 17890/19090？
+
+Clash/FlClash 等手机代理工具默认用 7890/9090，同时运行会端口冲突。改用高位段从源头避开，启动时还会自动检测占用并递增找可用端口。mihomo 仅监听 `127.0.0.1` 不设系统代理，流量层面不与其他代理工具冲突。
 
 ## 上游同步
 
