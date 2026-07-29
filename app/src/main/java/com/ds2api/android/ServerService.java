@@ -488,15 +488,27 @@ public class ServerService extends Service {
         // 写回 config.json（原子写：临时文件 + rename，避免与 UI 保存并发时写坏文件）
         atomicWrite(configFile, cfg.toString(2).getBytes(StandardCharsets.UTF_8));
         LogStore.get().log("APP", "Proxy 注入完成，已写回 config.json");
-        // 验证第一个账号的代理出口 IP（确认链路可用）
+        // 验证第一个账号的代理出口 IP（确认链路可用）。
+        // 延迟 + 重试：mihomo 刚启动时节点可能还没就绪，立即验证会误报失败。
         if (bindings.length() > 0) {
             final int firstPort = socks5Base;
             new Thread(() -> {
-                String exit = MihomoManager.verifyProxyExit(firstPort);
+                try { Thread.sleep(5000); } catch (InterruptedException ignored) { return; }
+                String exit = null;
+                for (int attempt = 1; attempt <= 3; attempt++) {
+                    exit = MihomoManager.verifyProxyExit(firstPort);
+                    if (exit != null) break;
+                    LogStore.get().log("APP", "代理验证第 " + attempt + " 次失败，"
+                            + (attempt < 3 ? "3秒后重试..." : "已重试3次仍失败"));
+                    if (attempt < 3) {
+                        try { Thread.sleep(3000); } catch (InterruptedException ignored) { return; }
+                    }
+                }
                 if (exit != null) {
                     LogStore.get().log("APP", "代理验证成功 ✓ 出口: " + exit);
                 } else {
-                    LogStore.get().log("APP", "代理验证失败 ✗ 端口 " + firstPort + " 无法访问外网");
+                    LogStore.get().log("APP", "代理验证失败 ✗ 端口 " + firstPort
+                            + " 无法访问外网（请检查节点是否可用）");
                 }
             }, "proxy-verify").start();
         }

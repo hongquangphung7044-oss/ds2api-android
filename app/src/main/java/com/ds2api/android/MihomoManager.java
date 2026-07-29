@@ -120,27 +120,52 @@ public final class MihomoManager {
         // 读取账号绑定
         List<AccountBinding> bindings = parseBindings(config, socks5Base, subs);
 
-        // 生成 mihomo config.yaml
+        // 1. 先下载所有订阅文件（App 层下载，绕过 mihomo 内置 http provider 的 403）
+        File providersDir = new File(workDir, "providers");
+        providersDir.mkdirs();
+        List<Subscription> okSubs = new ArrayList<>();
+        for (Subscription sub : subs) {
+            File subFile = new File(providersDir, sub.providerName + ".yaml");
+            if (downloadSubscription(sub.url, subFile, sub.name)) {
+                okSubs.add(sub);
+            } else {
+                LogStore.get().log(TAG, "订阅 [" + sub.name + "] 下载失败，跳过该订阅");
+            }
+        }
+        LogStore.get().log(TAG, "订阅下载完成: " + okSubs.size() + "/" + subs.size() + " 成功");
+
+        // 2. 没有订阅下载成功则无法继续
+        if (okSubs.isEmpty()) {
+            throw new IllegalStateException("所有订阅均下载失败（可能是 UA 被机场拦截或订阅 URL 无效），请检查日志");
+        }
+
+        // 3. 重建 bindings：只保留订阅下载成功的账号绑定
+        List<AccountBinding> okBindings = new ArrayList<>();
+        for (AccountBinding b : bindings) {
+            if (b.subscription == null) continue;
+            for (Subscription s : okSubs) {
+                if (s.providerName.equals(b.subscription.providerName)) {
+                    okBindings.add(b);
+                    break;
+                }
+            }
+        }
+        // 没有有效绑定时，给第一个账号兜底用第一个成功订阅
+        if (okBindings.isEmpty() && !bindings.isEmpty() && !okSubs.isEmpty()) {
+            AccountBinding b0 = bindings.get(0);
+            okBindings.add(new AccountBinding(b0.accountIdentifier, b0.nodeNames,
+                    b0.currentNodeIndex, b0.socksPort, b0.index, okSubs.get(0)));
+            LogStore.get().log(TAG, "账号 " + b0.accountIdentifier + " 未绑定订阅或绑定订阅失败，兜底使用 ["
+                    + okSubs.get(0).name + "]");
+        }
+
+        // 4. 只用下载成功的订阅生成 config.yaml（避免引用不存在的 provider 文件）
         File configFile = new File(workDir, "config.yaml");
-        String yaml = generateConfigYaml(subs, updateInterval, apiPort, apiSecret, bindings);
+        String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, okBindings);
         try (OutputStream out = new FileOutputStream(configFile)) {
             out.write(yaml.getBytes(StandardCharsets.UTF_8));
         }
         LogStore.get().log(TAG, "配置已写入 " + configFile.getAbsolutePath());
-
-        // App 层下载订阅到 providers/{providerName}.yaml（绕过 mihomo 内置 http provider 的 403）
-        File providersDir = new File(workDir, "providers");
-        providersDir.mkdirs();
-        int okCount = 0;
-        for (Subscription sub : subs) {
-            File subFile = new File(providersDir, sub.providerName + ".yaml");
-            if (downloadSubscription(sub.url, subFile, sub.name)) {
-                okCount++;
-            } else {
-                LogStore.get().log(TAG, "订阅 [" + sub.name + "] 下载失败，该订阅节点将不可用");
-            }
-        }
-        LogStore.get().log(TAG, "订阅下载完成: " + okCount + "/" + subs.size() + " 成功");
 
         // 启动子进程
         String binPath = ensureBinary(ctx);
@@ -700,48 +725,44 @@ public final class MihomoManager {
     }
 
     /**
-     * 测试单个节点到 chat.deepseek.com 的延迟。
-     * 节点来自 proxy-provider，会出现在 /proxies 全局映射中（被 group use 引用后）。
-     * @param nodeName 节点名（mihomo 代理名）
-     * @return 延迟毫秒数，-1 表示失败/超时
+     * 测试单个节点延迟。
+     * 不用 /proxies/{name}/delay（节点名编码 404 问题），改用 healthcheck 机制：
+     * 触发所有 provider healthcheck，然后遍历找到该节点的 history。
      */
     static int testNodeDelay(String nodeName) {
         if (!isRunning()) return -1;
-        HttpURLConnection c = null;
-        try {
-            // 节点名可能含中文/emoji/空格/方括号，必须做百分号编码后拼路径。
-            // 注意：URLEncoder 会把空格编成 +，path 段需用 %20，故替换。
-            String encoded = java.net.URLEncoder.encode(nodeName, "UTF-8").replace("+", "%20");
-            URL url = new URL("http://127.0.0.1:" + apiPort
-                    + "/proxies/" + encoded + "/delay"
-                    + "?url=" + java.net.URLEncoder.encode("https://chat.deepseek.com/", "UTF-8")
-                    + "&timeout=5000");
-            c = (HttpURLConnection) url.openConnection(java.net.Proxy.NO_PROXY);
-            c.setConnectTimeout(3000);
-            c.setReadTimeout(8000);  // 必须大于 delay timeout(5s)，否则 HTTP 先超时
-            c.setRequestMethod("GET");
-            if (!apiSecret.isEmpty()) {
-                c.setRequestProperty("Authorization", "Bearer " + apiSecret);
-            }
-            int code = c.getResponseCode();
-            // mihomo 延迟测试：成功返回 200 {"delay": N}，失败返回 400+ {"message": "..."}
-            InputStream stream = (code >= 200 && code < 300) ? c.getInputStream() : c.getErrorStream();
-            if (stream == null) return -1;
-            byte[] data = readAll(stream);
-            JSONObject resp = new JSONObject(new String(data, StandardCharsets.UTF_8));
-            int delay = resp.optInt("delay", -1);
-            if (delay > 0) return delay;
-            if (code != 200) {
-                LogStore.get().log(TAG, "延迟测试 [" + nodeName + "] HTTP " + code
-                        + ": " + resp.optString("message", ""));
-            }
-            return -1;
-        } catch (Throwable t) {
-            LogStore.get().log(TAG, "测试延迟失败 [" + nodeName + "]: " + t.getMessage());
-            return -1;
-        } finally {
-            if (c != null) c.disconnect();
+        if (nodeName == null || nodeName.isEmpty()) return -1;
+
+        // 触发所有 provider healthcheck
+        List<String> providerNames = fetchAllProviderNames();
+        for (String pn : providerNames) {
+            apiGet("/providers/proxies/" + pn + "/healthcheck");
         }
+        try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
+
+        // 遍历 provider 找到该节点，读 history
+        for (String pn : providerNames) {
+            JSONObject resp = apiGet("/providers/proxies/" + pn);
+            if (resp == null) continue;
+            JSONArray proxies = resp.optJSONArray("proxies");
+            if (proxies == null) continue;
+            for (int i = 0; i < proxies.length(); i++) {
+                JSONObject node = proxies.optJSONObject(i);
+                if (node == null) continue;
+                if (nodeName.equals(node.optString("name", ""))) {
+                    JSONArray history = node.optJSONArray("history");
+                    if (history != null && history.length() > 0) {
+                        JSONObject last = history.optJSONObject(history.length() - 1);
+                        if (last != null) {
+                            int delay = last.optInt("delay", 0);
+                            return delay > 0 ? delay : -1;
+                        }
+                    }
+                    return -1;
+                }
+            }
+        }
+        return -1;
     }
 
     /**
@@ -782,124 +803,64 @@ public final class MihomoManager {
     }
 
     /**
-     * 对策略组内所有真实代理节点执行延迟测试。
-     * 修复：组 all 数组里可能含机场塞的广告伪节点（"🇦🇶 [到期:...]"、"✅中文官网"等），
-     * 这些不是真实 proxy，测延迟必然 404。故先取 /proxies 全局映射，只对 type 为真实
-     * 代理类型(Shadowsocks/VMess/VLESS/Trojan/Hysteria2/TUIC/WireGuard/Http/Socks5/Snell/AnyTLS)
-     * 的节点测延迟，过滤掉伪节点。
+     * 对策略组内所有节点执行延迟测试。
+     * 不使用 /proxies/{name}/delay（节点名含中文/emoji/特殊字符时编码后 mihomo 返回 404），
+     * 改用 mihomo provider 原生 healthcheck 机制：
+     * 1. GET /providers/proxies/{name}/healthcheck 触发内核批量测所有节点
+     * 2. GET /providers/proxies/{name} 读每个节点 history 取延迟
+     * 内核自己测自己读，不依赖节点名 URL 编码，100% 可靠。
+     * 不做任何过滤（healthcheck 只测 provider 内的真实 proxy，广告伪节点本就不在 provider 里）。
      */
     static java.util.Map<String, Integer> testGroupDelay(String groupName) {
         java.util.Map<String, Integer> map = new java.util.HashMap<>();
         if (!isRunning()) return map;
 
-        // 1. 取组内节点列表
-        JSONObject group = apiGet("/proxies/" + groupName);
-        if (group == null) {
-            LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 取不到策略组（可能订阅未拉取成功）");
-            return map;
-        }
-        JSONArray all = group.optJSONArray("all");
-        if (all == null || all.length() == 0) {
-            LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 组内无节点（订阅可能拉取失败，请检查日志）");
+        // 1. 获取所有 provider 名
+        List<String> providerNames = fetchAllProviderNames();
+        if (providerNames.isEmpty()) {
+            LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 无可用 provider（订阅未加载）");
             return map;
         }
 
-        // 2. 取 /proxies 全局映射，构建「真实代理节点名 → type」集合
-        java.util.Set<String> realProxyNames = new java.util.HashSet<>();
-        JSONObject proxiesResp = apiGet("/proxies");
-        if (proxiesResp != null) {
-            JSONObject proxies = proxiesResp.optJSONObject("proxies");
-            if (proxies != null) {
-                JSONArray keys = proxies.names();
-                if (keys != null) {
-                    for (int i = 0; i < keys.length(); i++) {
-                        String name = keys.optString(i);
-                        JSONObject p = proxies.optJSONObject(name);
-                        if (p == null) continue;
-                        String type = p.optString("type", "");
-                        // 只保留真实代理节点，排除 Selector/URLTest/DIRECT/REJECT/Compatible 等非代理
-                        if (isRealProxyType(type)) {
-                            realProxyNames.add(name);
+        // 2. 对每个 provider 触发 healthcheck（内核批量测延迟）
+        for (String pn : providerNames) {
+            // healthcheck: GET /providers/proxies/{name}/healthcheck
+            // 注意 provider 名也可能含特殊字符，但这里 provider 名是 sub-0/sub-1，安全
+            apiGet("/providers/proxies/" + pn + "/healthcheck");
+        }
+
+        // 3. 等待内核完成 healthcheck（同步接口已返回，但 history 写入有微小延迟）
+        try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
+
+        // 4. 读每个 provider 的节点 history 汇总延迟
+        int total = 0, ok = 0;
+        for (String pn : providerNames) {
+            JSONObject resp = apiGet("/providers/proxies/" + pn);
+            if (resp == null) continue;
+            JSONArray proxies = resp.optJSONArray("proxies");
+            if (proxies == null) continue;
+            for (int i = 0; i < proxies.length(); i++) {
+                JSONObject node = proxies.optJSONObject(i);
+                if (node == null) continue;
+                String name = node.optString("name", "");
+                if (name.isEmpty()) continue;
+                total++;
+                JSONArray history = node.optJSONArray("history");
+                if (history != null && history.length() > 0) {
+                    JSONObject last = history.optJSONObject(history.length() - 1);
+                    if (last != null) {
+                        int delay = last.optInt("delay", 0);
+                        if (delay > 0) {
+                            map.put(name, delay);
+                            ok++;
                         }
                     }
                 }
             }
         }
-
-        // 3. 过滤：只测组内真实代理节点
-        List<String> toTest = new ArrayList<>();
-        int filteredAds = 0;
-        for (int i = 0; i < all.length(); i++) {
-            String nodeName = all.optString(i);
-            if (nodeName == null || nodeName.isEmpty()) continue;
-            if (realProxyNames.isEmpty() || realProxyNames.contains(nodeName)) {
-                toTest.add(nodeName);
-            } else {
-                filteredAds++;
-            }
-        }
-        if (filteredAds > 0) {
-            LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 过滤 " + filteredAds
-                    + " 个广告/伪节点（非真实代理）");
-        }
-        if (toTest.isEmpty()) {
-            LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 组内无真实代理节点（订阅可能拉取失败）");
-            return map;
-        }
-
-        // 4. 并发测试每个真实节点延迟
-        int n = toTest.size();
-        java.util.concurrent.ExecutorService pool =
-                java.util.concurrent.Executors.newFixedThreadPool(Math.min(n, 8));
-        java.util.concurrent.ConcurrentHashMap<String, Integer> result =
-                new java.util.concurrent.ConcurrentHashMap<>();
-        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(n);
-        for (String nodeName : toTest) {
-            pool.execute(() -> {
-                try {
-                    int delay = testNodeDelay(nodeName);
-                    if (delay > 0) result.put(nodeName, delay);
-                } catch (Throwable ignored) {
-                } finally {
-                    latch.countDown();
-                }
-            });
-        }
-        try {
-            latch.await(60, java.util.concurrent.TimeUnit.SECONDS);
-        } catch (InterruptedException ignored) {
-        }
-        pool.shutdownNow();
-        map.putAll(result);
         LogStore.get().log(TAG, "组延迟测试 [" + groupName + "] 完成: "
-                + map.size() + "/" + n + " 个真实节点可用");
+                + ok + "/" + total + " 个节点可用");
         return map;
-    }
-
-    /** 判断 mihomo proxy type 是否为真实代理（可测延迟），排除策略组/内置类型。 */
-    private static boolean isRealProxyType(String type) {
-        if (type == null || type.isEmpty()) return false;
-        switch (type) {
-            case "Shadowsocks":
-            case "ShadowsocksR":
-            case "VMess":
-            case "VLESS":
-            case "Trojan":
-            case "Hysteria":
-            case "Hysteria2":
-            case "TUIC":
-            case "WireGuard":
-            case "Http":
-            case "Socks5":
-            case "Snell":
-            case "AnyTLS":
-            case "ShadowTLS":
-            case "SSH":
-            case "Juicity":
-                return true;
-            default:
-                return false;
-        }
     }
 
     private static boolean apiPut(String path, String body) {
