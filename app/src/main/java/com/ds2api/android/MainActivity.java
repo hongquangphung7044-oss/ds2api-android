@@ -14,6 +14,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.text.method.ScrollingMovementMethod;
 import android.view.Gravity;
 import android.view.View;
@@ -59,9 +60,27 @@ public class MainActivity extends Activity implements LogStore.Listener {
         super.onCreate(savedInstanceState);
         buildUi();
         askNotificationPermission();
+        requestBatteryOptimizationExemption();
         LogStore.get().addListener(this);
         handler.post(ticker);
         refreshLogs();
+    }
+
+    /** 请求电池优化豁免：让系统不限制后台运行，防止服务被杀。 */
+    private void requestBatteryOptimizationExemption() {
+        try {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            if (pm == null) return;
+            // 已加入白名单则不再请求
+            if (pm.isIgnoringBatteryOptimizations(getPackageName())) return;
+            Intent intent = new Intent(
+                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+            intent.setData(android.net.Uri.parse("package:" + getPackageName()));
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+        } catch (Throwable t) {
+            LogStore.get().log("APP", "请求电池优化豁免失败: " + t.getMessage());
+        }
     }
 
     private void buildUi() {

@@ -86,8 +86,21 @@ public class ProxyConfigActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        loadConfig();
-        buildUi();
+        try {
+            loadConfig();
+            buildUi();
+        } catch (Throwable t) {
+            // 加载配置/构建 UI 异常时，显示错误信息而非闪退
+            android.util.Log.e("ProxyConfig", "onCreate 失败", t);
+            TextView err = new TextView(this);
+            err.setPadding(dp(20), dp(40), dp(20), dp(20));
+            err.setText("代理配置加载失败: " + t.getMessage()
+                    + "\n\n请尝试：停止服务 → 删除 mihomo_config.json → 重新进入。\n\n"
+                    + "异常: " + t.getClass().getName());
+            err.setTextSize(13);
+            setContentView(err);
+            return;
+        }
         // 如果 mihomo 已在运行，立即拉取节点
         if (MihomoManager.isRunning()) {
             new Thread(this::fetchNodes, "node-fetcher").start();
