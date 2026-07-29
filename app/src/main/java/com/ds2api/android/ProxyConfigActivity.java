@@ -58,23 +58,27 @@ public class ProxyConfigActivity extends Activity {
     private static final String COLOR_BTN_SECONDARY = "#F1F5F9";
     private static final String COLOR_BTN_SECONDARY_BORDER = "#CBD5E1";
 
-    private EditText subUrlField;
     private CheckBox enabledCheckbox;
-    private TextView nodeCountLabel;
     private TextView mihomoStatusLabel;
     private Button startMihomoBtn;
     private Button stopMihomoBtn;
-    private Button refreshBtn;
     private Button saveBtn;
+    private LinearLayout subscriptionListContainer;   // 订阅列表容器
     private LinearLayout accountListContainer;
-    private View nodeBindingSection;  // 节点绑定整段（mihomo 未运行时隐藏）
+    private View nodeBindingSection;
 
     private JSONObject config;
     private JSONObject mihomoConfig;
-    private List<String> nodeList = new ArrayList<>();
+    /** 订阅名 → 节点列表缓存 */
+    private final java.util.Map<String, List<String>> subNodeCache = new java.util.LinkedHashMap<>();
+    /** 订阅名列表（按添加顺序） */
+    private final List<String> subscriptionNames = new ArrayList<>();
+    /** 每个账号的 Spinner 组 */
     private final List<List<Spinner>> accountSpinners = new ArrayList<>();
     private final List<List<TextView>> accountDelayLabels = new ArrayList<>();
     private final List<String> accountIdentifiers = new ArrayList<>();
+    /** 每个账号的订阅选择 Spinner */
+    private final List<Spinner> accountSubSpinners = new ArrayList<>();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -92,7 +96,7 @@ public class ProxyConfigActivity extends Activity {
     protected void onResume() {
         super.onResume();
         refreshMihomoStatus();
-        if (MihomoManager.isRunning() && nodeList.isEmpty()) {
+        if (MihomoManager.isRunning() && subNodeCache.isEmpty()) {
             new Thread(this::fetchNodes, "node-fetcher").start();
         }
     }
@@ -158,67 +162,173 @@ public class ProxyConfigActivity extends Activity {
         enabledCheckbox.setTextColor(Color.parseColor(COLOR_TEXT));
         root.addView(enabledCheckbox);
 
-        // 订阅地址标签
-        root.addView(makeLabel("机场订阅地址"));
+        // ===== 订阅管理区 =====
+        root.addView(makeSectionTitle("机场订阅"));
 
-        // 订阅地址输入框
-        subUrlField = new EditText(this);
-        subUrlField.setHint("https://airport.example.com/sub");
-        subUrlField.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
-        subUrlField.setText(mihomoConfig.optString("subscription_url", ""));
-        subUrlField.setSingleLine(true);
-        subUrlField.setTextSize(14);
-        subUrlField.setTextColor(Color.parseColor(COLOR_TEXT));
-        subUrlField.setHintTextColor(Color.parseColor(COLOR_GRAY));
-        subUrlField.setPadding(dp(12), dp(10), dp(12), dp(10));
-        subUrlField.setBackground(roundedBackground("#FFFFFF", COLOR_DIVIDER, dp(8)));
-        LinearLayout.LayoutParams subLp = new LinearLayout.LayoutParams(-1, -2);
-        subLp.topMargin = dp(4);
-        root.addView(subUrlField, subLp);
+        subscriptionListContainer = new LinearLayout(this);
+        subscriptionListContainer.setOrientation(LinearLayout.VERTICAL);
+        root.addView(subscriptionListContainer);
+        rebuildSubscriptionList();
+
+        // 添加订阅按钮
+        Button addSubBtn = makeSecondaryButton("+ 添加订阅", v -> addSubscriptionRow("", "", true));
+        LinearLayout.LayoutParams addSubLp = new LinearLayout.LayoutParams(-2, dp(38));
+        addSubLp.topMargin = dp(6);
+        root.addView(addSubBtn, addSubLp);
+
+        // 分隔线
+        root.addView(makeDivider());
 
         // mihomo 状态行
         LinearLayout statusRow = new LinearLayout(this);
         statusRow.setOrientation(LinearLayout.HORIZONTAL);
         statusRow.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams srLp = new LinearLayout.LayoutParams(-1, -2);
-        srLp.topMargin = dp(10);
+        srLp.topMargin = dp(4);
         root.addView(statusRow, srLp);
 
         mihomoStatusLabel = new TextView(this);
         mihomoStatusLabel.setTextSize(13);
         statusRow.addView(mihomoStatusLabel, new LinearLayout.LayoutParams(0, -2, 1f));
 
-        // 启动/停止 mihomo 按钮
         startMihomoBtn = makePrimaryButton("启动 mihomo", v -> doStartMihomo());
         stopMihomoBtn = makeSecondaryButton("停止", v -> doStopMihomo());
         statusRow.addView(startMihomoBtn, new LinearLayout.LayoutParams(-2, dp(40)));
         statusRow.addView(stopMihomoBtn, new LinearLayout.LayoutParams(-2, dp(40)));
 
-        // 更新订阅 + 节点数
-        LinearLayout refreshRow = new LinearLayout(this);
-        refreshRow.setOrientation(LinearLayout.HORIZONTAL);
-        refreshRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams rrLp = new LinearLayout.LayoutParams(-1, -2);
-        rrLp.topMargin = dp(8);
-        root.addView(refreshRow, rrLp);
-
-        refreshBtn = makeSecondaryButton("更新订阅", v -> doRefresh());
-        nodeCountLabel = new TextView(this);
-        nodeCountLabel.setPadding(dp(12), 0, 0, 0);
-        nodeCountLabel.setTextSize(13);
-        nodeCountLabel.setTextColor(Color.parseColor(COLOR_TEXT_LIGHT));
-        refreshRow.addView(refreshBtn, new LinearLayout.LayoutParams(-2, dp(40)));
-        refreshRow.addView(nodeCountLabel, new LinearLayout.LayoutParams(0, -2, 1f));
-
         // 分隔线
         root.addView(makeDivider());
 
-        // 节点绑定区（整体，mihomo 未运行时隐藏）
+        // 节点绑定区
         nodeBindingSection = makeNodeBindingSection();
         root.addView(nodeBindingSection);
 
         scroll.addView(root);
         setContentView(scroll);
+    }
+
+    /** 重建订阅列表 UI（从 mihomoConfig.subscriptions 读取）。 */
+    private void rebuildSubscriptionList() {
+        subscriptionListContainer.removeAllViews();
+        subscriptionNames.clear();
+
+        JSONArray subs = mihomoConfig.optJSONArray("subscriptions");
+        // 兼容旧版单订阅
+        if (subs == null) {
+            String oldUrl = mihomoConfig.optString("subscription_url", "").trim();
+            if (!oldUrl.isEmpty()) {
+                subs = new JSONArray();
+                try {
+                    JSONObject s = new JSONObject();
+                    s.put("name", "默认订阅");
+                    s.put("url", oldUrl);
+                    s.put("enabled", true);
+                    subs.put(s);
+                    mihomoConfig.put("subscriptions", subs);
+                    mihomoConfig.remove("subscription_url");
+                } catch (Throwable ignored) {}
+            }
+        }
+        if (subs != null) {
+            for (int i = 0; i < subs.length(); i++) {
+                JSONObject s = subs.optJSONObject(i);
+                if (s == null) continue;
+                addSubscriptionRow(s.optString("name", ""), s.optString("url", ""),
+                        s.optBoolean("enabled", true));
+            }
+        }
+    }
+
+    /** 添加一行订阅输入（名称 + URL + 启用 + 删除）。 */
+    private void addSubscriptionRow(String name, String url, boolean enabled) {
+        final LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(dp(12), dp(12), dp(12), dp(12));
+        LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(-1, -2);
+        rowLp.topMargin = dp(8);
+        row.setLayoutParams(rowLp);
+        row.setBackground(cardBackground());
+
+        // 第一行：名称 + 启用 + 删除
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+
+        EditText nameField = new EditText(this);
+        nameField.setHint("订阅名称");
+        nameField.setText(name);
+        nameField.setTextSize(13);
+        nameField.setSingleLine(true);
+        nameField.setTextColor(Color.parseColor(COLOR_TEXT));
+        nameField.setHintTextColor(Color.parseColor(COLOR_GRAY));
+        nameField.setPadding(dp(8), dp(6), dp(8), dp(6));
+        nameField.setBackground(roundedBackground("#FFFFFF", COLOR_DIVIDER, dp(6)));
+        header.addView(nameField, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        CheckBox subEnabled = new CheckBox(this);
+        subEnabled.setChecked(enabled);
+        subEnabled.setText("启用");
+        subEnabled.setTextSize(12);
+        subEnabled.setTextColor(Color.parseColor(COLOR_TEXT_LIGHT));
+        header.addView(subEnabled, new LinearLayout.LayoutParams(-2, -2));
+
+        Button delBtn = new Button(this);
+        delBtn.setText("✕");
+        delBtn.setTextSize(12);
+        delBtn.setAllCaps(false);
+        delBtn.setTextColor(Color.parseColor(COLOR_RED));
+        delBtn.setPadding(dp(10), dp(4), dp(10), dp(4));
+        delBtn.setBackground(roundedBackground("#FEF2F2", "#FECACA", dp(6)));
+        delBtn.setOnClickListener(v -> subscriptionListContainer.removeView(row));
+        header.addView(delBtn, new LinearLayout.LayoutParams(-2, dp(32)));
+
+        row.addView(header);
+
+        // 第二行：URL
+        EditText urlField = new EditText(this);
+        urlField.setHint("https://airport.example.com/sub");
+        urlField.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
+        urlField.setText(url);
+        urlField.setTextSize(13);
+        urlField.setSingleLine(true);
+        urlField.setTextColor(Color.parseColor(COLOR_TEXT));
+        urlField.setHintTextColor(Color.parseColor(COLOR_GRAY));
+        urlField.setPadding(dp(8), dp(6), dp(8), dp(6));
+        urlField.setBackground(roundedBackground("#FFFFFF", COLOR_DIVIDER, dp(6)));
+        LinearLayout.LayoutParams urlLp = new LinearLayout.LayoutParams(-1, -2);
+        urlLp.topMargin = dp(4);
+        row.addView(urlField, urlLp);
+
+        // 用 tag 存储控件引用，保存时遍历读取
+        row.setTag(new Object[]{nameField, urlField, subEnabled});
+
+        subscriptionListContainer.addView(row);
+    }
+
+    /** 从 UI 收集订阅列表写入 mihomoConfig。 */
+    private void collectSubscriptionsFromUi() throws Exception {
+        JSONArray subs = new JSONArray();
+        for (int i = 0; i < subscriptionListContainer.getChildCount(); i++) {
+            View child = subscriptionListContainer.getChildAt(i);
+            if (child instanceof LinearLayout) {
+                Object[] tags = (Object[]) child.getTag();
+                if (tags == null || tags.length < 3) continue;
+                EditText nameField = (EditText) tags[0];
+                EditText urlField = (EditText) tags[1];
+                CheckBox subEnabled = (CheckBox) tags[2];
+                String n = nameField.getText().toString().trim();
+                String u = urlField.getText().toString().trim();
+                if (u.isEmpty()) continue;
+                if (n.isEmpty()) n = "订阅" + (i + 1);
+                JSONObject s = new JSONObject();
+                s.put("name", n);
+                s.put("url", u);
+                s.put("enabled", subEnabled.isChecked());
+                subs.put(s);
+            }
+        }
+        mihomoConfig.put("subscriptions", subs);
+        mihomoConfig.remove("subscription_url");  // 清理旧字段
     }
 
     /** 构建节点绑定区。 */
@@ -258,7 +368,9 @@ public class ProxyConfigActivity extends Activity {
     private void buildAccountBindings() {
         accountListContainer.removeAllViews();
         accountSpinners.clear();
+        accountDelayLabels.clear();
         accountIdentifiers.clear();
+        accountSubSpinners.clear();
 
         JSONArray accounts = config.optJSONArray("accounts");
         if (accounts == null || accounts.length() == 0) {
@@ -274,6 +386,9 @@ public class ProxyConfigActivity extends Activity {
         JSONArray bindings = mihomoConfig.optJSONArray("account_bindings");
         if (bindings == null) bindings = new JSONArray();
 
+        // 收集所有订阅名供选择
+        List<String> subNames = getSubscriptionNames();
+
         for (int i = 0; i < accounts.length(); i++) {
             JSONObject acc = accounts.optJSONObject(i);
             if (acc == null) continue;
@@ -283,21 +398,46 @@ public class ProxyConfigActivity extends Activity {
             if (identifier.isEmpty()) continue;
 
             JSONArray existingNodes = null;
+            String existingSubName = "";
             for (int j = 0; j < bindings.length(); j++) {
                 JSONObject b = bindings.optJSONObject(j);
                 if (b != null && identifier.equals(b.optString("account_identifier", ""))) {
                     existingNodes = b.optJSONArray("node_names");
+                    existingSubName = b.optString("subscription_name", "");
                     break;
                 }
             }
 
             accountIdentifiers.add(identifier);
-            accountListContainer.addView(buildAccountCard(i, identifier, existingNodes));
+            accountListContainer.addView(buildAccountCard(i, identifier, existingNodes,
+                    existingSubName, subNames));
         }
     }
 
-    /** 构建单个账号卡片（浅色卡片风格）。 */
-    private View buildAccountCard(int accIndex, String identifier, JSONArray existingNodes) {
+    /** 从 UI 收集当前所有订阅名（已填了名称的）。 */
+    private List<String> getSubscriptionNames() {
+        List<String> names = new ArrayList<>();
+        for (int i = 0; i < subscriptionListContainer.getChildCount(); i++) {
+            View child = subscriptionListContainer.getChildAt(i);
+            if (child instanceof LinearLayout) {
+                Object[] tags = (Object[]) child.getTag();
+                if (tags == null || tags.length < 3) continue;
+                EditText nameField = (EditText) tags[0];
+                EditText urlField = (EditText) tags[1];
+                CheckBox subEnabled = (CheckBox) tags[2];
+                String u = urlField.getText().toString().trim();
+                if (u.isEmpty() || !subEnabled.isChecked()) continue;
+                String n = nameField.getText().toString().trim();
+                if (n.isEmpty()) n = "订阅" + (i + 1);
+                names.add(n);
+            }
+        }
+        return names;
+    }
+
+    /** 构建单个账号卡片。 */
+    private View buildAccountCard(int accIndex, String identifier, JSONArray existingNodes,
+                                   String presetSubName, List<String> subNames) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(dp(14), dp(14), dp(14), dp(14));
@@ -314,10 +454,56 @@ public class ProxyConfigActivity extends Activity {
         accLabel.setTextSize(14);
         card.addView(accLabel);
 
+        // 订阅选择行
+        LinearLayout subRow = new LinearLayout(this);
+        subRow.setOrientation(LinearLayout.HORIZONTAL);
+        subRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams subRowLp = new LinearLayout.LayoutParams(-1, -2);
+        subRowLp.topMargin = dp(6);
+        subRow.setLayoutParams(subRowLp);
+
+        TextView subLabel = new TextView(this);
+        subLabel.setText("订阅");
+        subLabel.setTextColor(Color.parseColor(COLOR_TEXT_LIGHT));
+        subLabel.setTextSize(13);
+        subLabel.setMinWidth(dp(50));
+        subRow.addView(subLabel);
+
+        Spinner subSpinner = new Spinner(this);
+        List<String> subOptions = new ArrayList<>();
+        subOptions.add("（未选择）");
+        subOptions.addAll(subNames);
+        ArrayAdapter<String> subAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, subOptions);
+        subAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        subSpinner.setAdapter(subAdapter);
+        // 选中预设值
+        if (!presetSubName.isEmpty()) {
+            for (int k = 0; k < subOptions.size(); k++) {
+                if (subOptions.get(k).equals(presetSubName)) {
+                    subSpinner.setSelection(k);
+                    break;
+                }
+            }
+        }
+        accountSubSpinners.add(subSpinner);
+        subRow.addView(subSpinner, new LinearLayout.LayoutParams(0, -2, 1f));
+        card.addView(subRow);
+
         List<Spinner> spinners = new ArrayList<>();
         List<TextView> delayLabels = new ArrayList<>();
         accountSpinners.add(spinners);
         accountDelayLabels.add(delayLabels);
+
+        // 切换订阅时刷新该卡片所有节点 Spinner 选项
+        subSpinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
+                refreshNodeOptionsForCard(card, spinners);
+            }
+            @Override
+            public void onNothingSelected(android.widget.AdapterView<?> parent) {}
+        });
 
         int nodeCount = (existingNodes != null && existingNodes.length() > 0)
                 ? existingNodes.length() : 1;
@@ -350,6 +536,26 @@ public class ProxyConfigActivity extends Activity {
         return card;
     }
 
+    /** 根据账号卡片中选中的订阅，刷新该卡片所有节点 Spinner 的选项。 */
+    private void refreshNodeOptionsForCard(LinearLayout card, List<Spinner> spinners) {
+        int subSpinnerIdx = -1;
+        for (int i = 0; i < accountListContainer.getChildCount(); i++) {
+            if (accountListContainer.getChildAt(i) == card) {
+                subSpinnerIdx = i;
+                break;
+            }
+        }
+        if (subSpinnerIdx < 0 || subSpinnerIdx >= accountSubSpinners.size()) return;
+        Spinner subSpinner = accountSubSpinners.get(subSpinnerIdx);
+        String subName = subSpinner.getSelectedItemPosition() == 0 ? ""
+                : subSpinner.getSelectedItem().toString();
+        List<String> nodes = subName.isEmpty() ? new ArrayList<>() : subNodeCache.get(subName);
+        if (nodes == null) nodes = new ArrayList<>();
+        for (Spinner s : spinners) {
+            updateSpinnerAdapterWithNodes(s, nodes);
+        }
+    }
+
     private View buildNodeRow(List<Spinner> spinners, List<TextView> delayLabels,
                               int nodeIndex, String preset, ViewGroup parentCard) {
         // 容器：垂直两行布局，避免横向拥挤导致延迟标签被遮挡
@@ -363,9 +569,16 @@ public class ProxyConfigActivity extends Activity {
         Spinner spinner = new Spinner(this);
         updateSpinnerAdapter(spinner);
         if (!preset.isEmpty()) {
-            for (int i = 0; i < nodeList.size(); i++) {
-                if (nodeList.get(i).equals(preset)) {
-                    spinner.setSelection(i + 1);  // +1 因为第 0 项是"未选择"
+            // 在所有订阅节点中查找匹配的预设节点名
+            for (List<String> nodes : subNodeCache.values()) {
+                for (int i = 0; i < nodes.size(); i++) {
+                    if (nodes.get(i).equals(preset)) {
+                        spinner.setSelection(i + 1);  // +1 因为第 0 项是"未选择"
+                        break;
+                    }
+                }
+                if (spinner.getSelectedItem() != null
+                        && spinner.getSelectedItem().toString().equals(preset)) {
                     break;
                 }
             }
@@ -505,29 +718,61 @@ public class ProxyConfigActivity extends Activity {
     }
 
     private void updateSpinnerAdapter(Spinner spinner) {
+        updateSpinnerAdapterWithNodes(spinner, null);
+    }
+
+    /** 用指定节点列表更新 Spinner，nodes 为 null 时使用第一个订阅的节点。 */
+    private void updateSpinnerAdapterWithNodes(Spinner spinner, List<String> nodes) {
+        if (nodes == null) {
+            // 默认用缓存中第一个订阅的节点
+            if (!subNodeCache.isEmpty()) {
+                nodes = subNodeCache.values().iterator().next();
+            } else {
+                nodes = new ArrayList<>();
+            }
+        }
+        // 保留当前选择
+        String current = null;
+        if (spinner.getAdapter() != null && spinner.getSelectedItem() != null) {
+            current = spinner.getSelectedItem().toString();
+        }
         List<String> items = new ArrayList<>();
         items.add("（未选择）");
-        items.addAll(nodeList);
+        items.addAll(nodes);
         ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
                 android.R.layout.simple_spinner_item, items);
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinner.setAdapter(adapter);
+        // 恢复选择
+        if (current != null) {
+            for (int k = 0; k < items.size(); k++) {
+                if (items.get(k).equals(current)) {
+                    spinner.setSelection(k);
+                    break;
+                }
+            }
+        }
     }
 
     // ========== 操作 ==========
 
     /** 独立启动 mihomo（不依赖 ds2api）。 */
     private void doStartMihomo() {
-        String url = subUrlField.getText().toString().trim();
-        if (url.isEmpty()) {
-            toast("请先填写订阅地址");
+        // 先从 UI 收集订阅信息
+        try {
+            collectSubscriptionsFromUi();
+        } catch (Throwable t) {
+            toast("收集订阅失败: " + t.getMessage());
             return;
         }
-        // 先保存到 mihomo_config.json（独立文件，避免被 Go 服务端覆盖）
+        JSONArray subs = mihomoConfig.optJSONArray("subscriptions");
+        if (subs == null || subs.length() == 0) {
+            toast("请至少添加一个订阅");
+            return;
+        }
+        // 先保存到 mihomo_config.json
         try {
-            // 同步 checkbox 状态，避免覆盖用户选择
             mihomoConfig.put("enabled", enabledCheckbox.isChecked());
-            mihomoConfig.put("subscription_url", url);
             if (!mihomoConfig.has("api_port")) {
                 mihomoConfig.put("api_port", MihomoManager.DEFAULT_API_PORT);
             }
@@ -539,7 +784,7 @@ public class ProxyConfigActivity extends Activity {
             }
             writeMihomoConfig();
         } catch (Throwable t) {
-            toast("保存订阅地址失败: " + t.getMessage());
+            toast("保存配置失败: " + t.getMessage());
             return;
         }
 
@@ -551,9 +796,7 @@ public class ProxyConfigActivity extends Activity {
                 MihomoManager.start(this, workDir, mihomoConfig);
                 boolean ready = MihomoManager.probeReady();
                 if (ready) {
-                    // 等 mihomo 拉取订阅
                     Thread.sleep(2000);
-                    // 把每个账号的 selector 切到用户选定的主节点
                     MihomoManager.applyNodeSelection(mihomoConfig);
                     fetchNodes();
                 }
@@ -578,7 +821,7 @@ public class ProxyConfigActivity extends Activity {
     private void doStopMihomo() {
         MihomoManager.stop();
         refreshMihomoStatus();
-        nodeCountLabel.setText("节点数: -");
+        subNodeCache.clear();
         toast("mihomo 已停止");
     }
 
@@ -587,27 +830,29 @@ public class ProxyConfigActivity extends Activity {
             toast("请先启动 mihomo");
             return;
         }
-        refreshBtn.setEnabled(false);
-        refreshBtn.setText("刷新中...");
         new Thread(() -> {
-            boolean ok = MihomoManager.refreshSubscription();
-            if (ok) {
+            // 刷新所有订阅 provider
+            boolean allOk = true;
+            List<String> providers = MihomoManager.fetchAllProviderNames();
+            for (String p : providers) {
+                if (!MihomoManager.refreshSubscription(p)) allOk = false;
+            }
+            if (allOk) {
                 try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
                 fetchNodes();
             }
-            runOnUiThread(() -> {
-                refreshBtn.setEnabled(true);
-                refreshBtn.setText("更新订阅");
-                toast(ok ? "订阅已刷新" : "刷新失败，请检查日志");
-            });
+            boolean finalAllOk = allOk;
+            runOnUiThread(() -> toast(finalAllOk ? "订阅已刷新" : "部分刷新失败，请检查日志"));
         }, "sub-refresh").start();
     }
 
     private void doSave() {
         try {
+            // 先收集订阅
+            collectSubscriptionsFromUi();
             mihomoConfig.put("enabled", enabledCheckbox.isChecked());
-            mihomoConfig.put("subscription_url", subUrlField.getText().toString().trim());
 
+            // 收集账号绑定（含订阅名）
             JSONArray bindings = new JSONArray();
             Set<String> seen = new HashSet<>();
             for (int i = 0; i < accountIdentifiers.size(); i++) {
@@ -622,9 +867,18 @@ public class ProxyConfigActivity extends Activity {
                     if ("（未选择）".equals(name) || name.isEmpty()) continue;
                     nodeNames.add(name);
                 }
-                if (nodeNames.isEmpty()) continue;
+                // 获取该账号选中的订阅名
+                String subName = "";
+                if (i < accountSubSpinners.size()) {
+                    Spinner subSpinner = accountSubSpinners.get(i);
+                    if (subSpinner.getSelectedItemPosition() > 0) {
+                        subName = subSpinner.getSelectedItem().toString();
+                    }
+                }
+                if (nodeNames.isEmpty() && subName.isEmpty()) continue;
                 JSONObject b = new JSONObject();
                 b.put("account_identifier", identifier);
+                b.put("subscription_name", subName);
                 b.put("node_names", new JSONArray(nodeNames));
                 b.put("current_node_index", 0);
                 bindings.put(b);
@@ -638,7 +892,6 @@ public class ProxyConfigActivity extends Activity {
                     boolean ok = MihomoManager.reloadConfig();
                     if (ok) {
                         try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
-                        // 热重载后重新应用节点选择
                         MihomoManager.applyNodeSelection(mihomoConfig);
                     }
                     runOnUiThread(() -> toast(ok ? "已保存并应用节点" : "热重载失败，下次启动生效"));
@@ -675,14 +928,35 @@ public class ProxyConfigActivity extends Activity {
 
     private void fetchNodes() {
         if (!MihomoManager.isRunning()) {
-            runOnUiThread(() -> nodeCountLabel.setText("节点数: mihomo 未运行"));
+            runOnUiThread(() -> buildAccountBindings());
             return;
         }
-        List<String> nodes = MihomoManager.fetchNodeList();
+        // 获取所有 provider 名，逐个拉取节点
+        List<String> providers = MihomoManager.fetchAllProviderNames();
+        // 构建订阅名 → providerName 映射
+        java.util.Map<String, String> subNameToProvider = new java.util.HashMap<>();
+        JSONArray subs = mihomoConfig.optJSONArray("subscriptions");
+        if (subs != null) {
+            for (int i = 0; i < subs.length(); i++) {
+                JSONObject s = subs.optJSONObject(i);
+                if (s == null) continue;
+                String name = s.optString("name", "订阅" + (i + 1));
+                String providerName = "sub-" + i;
+                subNameToProvider.put(name, providerName);
+            }
+        }
+
+        subNodeCache.clear();
+        int totalNodes = 0;
+        for (String subName : subNameToProvider.keySet()) {
+            String providerName = subNameToProvider.get(subName);
+            List<String> nodes = MihomoManager.fetchNodeList(providerName);
+            subNodeCache.put(subName, nodes);
+            totalNodes += nodes.size();
+        }
+
         runOnUiThread(() -> {
-            nodeList = nodes;
-            nodeCountLabel.setText("节点数: " + nodeList.size());
-            // 重建绑定区：nodeList 现在已填充，preset 能正确匹配
+            // 重建绑定区：节点列表已就绪，preset 能正确匹配
             buildAccountBindings();
         });
     }
@@ -698,6 +972,19 @@ public class ProxyConfigActivity extends Activity {
         tv.setText(text);
         tv.setTextSize(13);
         tv.setTextColor(Color.parseColor(COLOR_TEXT_LIGHT));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+        lp.topMargin = dp(10);
+        tv.setLayoutParams(lp);
+        return tv;
+    }
+
+    /** 区块标题。 */
+    private TextView makeSectionTitle(String text) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextSize(15);
+        tv.setTypeface(Typeface.DEFAULT_BOLD);
+        tv.setTextColor(Color.parseColor(COLOR_TEXT));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
         lp.topMargin = dp(10);
         tv.setLayoutParams(lp);

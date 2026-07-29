@@ -103,13 +103,8 @@ public final class MihomoManager {
         File providersDir = new File(workDir, "providers");
         providersDir.mkdirs();
 
-        // 解析配置（只要有订阅地址即可启动，不强制要求 enabled=true）
+        // 解析配置
         enabled = true;
-        String subscriptionUrl = config.optString("subscription_url", "").trim();
-        if (subscriptionUrl.isEmpty()) {
-            throw new IllegalStateException("未配置订阅地址");
-        }
-        int updateInterval = config.optInt("subscription_update_interval", 3600);
         apiPort = config.optInt("api_port", DEFAULT_API_PORT);
         apiSecret = config.optString("api_secret", "").trim();
         if (apiSecret.isEmpty()) {
@@ -117,14 +112,19 @@ public final class MihomoManager {
             config.put("api_secret", apiSecret);
         }
         int socks5Base = config.optInt("socks5_base_port", DEFAULT_SOCKS5_BASE_PORT);
+        int updateInterval = config.optInt("subscription_update_interval", 3600);
 
+        // 解析订阅列表（支持多订阅）+ 兼容旧版单订阅字段
+        List<Subscription> subs = parseSubscriptions(config);
+        if (subs.isEmpty()) {
+            throw new IllegalStateException("未配置任何订阅地址");
+        }
         // 读取账号绑定
-        List<AccountBinding> bindings = parseBindings(config, socks5Base);
+        List<AccountBinding> bindings = parseBindings(config, socks5Base, subs);
 
         // 生成 mihomo config.yaml
         File configFile = new File(workDir, "config.yaml");
-        String yaml = generateConfigYaml(subscriptionUrl, updateInterval, apiPort,
-                apiSecret, bindings);
+        String yaml = generateConfigYaml(subs, updateInterval, apiPort, apiSecret, bindings);
         try (OutputStream out = new FileOutputStream(configFile)) {
             out.write(yaml.getBytes(StandardCharsets.UTF_8));
         }
@@ -228,10 +228,10 @@ public final class MihomoManager {
 
     // ========== mihomo API 封装 ==========
 
-    /** 获取订阅中的节点名列表。 */
-    static List<String> fetchNodeList() {
+    /** 获取指定订阅 provider 的节点名列表。 */
+    static List<String> fetchNodeList(String providerName) {
         List<String> names = new ArrayList<>();
-        JSONObject resp = apiGet("/providers/proxies/airport");
+        JSONObject resp = apiGet("/providers/proxies/" + providerName);
         if (resp == null) return names;
         JSONArray proxies = resp.optJSONArray("proxies");
         if (proxies == null) return names;
@@ -247,9 +247,24 @@ public final class MihomoManager {
         return names;
     }
 
-    /** 强制刷新订阅。 */
-    static boolean refreshSubscription() {
-        return apiPut("/providers/proxies/airport", null);
+    /** 强制刷新指定订阅 provider。 */
+    static boolean refreshSubscription(String providerName) {
+        return apiPut("/providers/proxies/" + providerName, null);
+    }
+
+    /** 获取所有已配置订阅的 provider 名列表。 */
+    static List<String> fetchAllProviderNames() {
+        List<String> names = new ArrayList<>();
+        JSONObject resp = apiGet("/providers/proxies");
+        if (resp == null) return names;
+        JSONObject providers = resp.optJSONObject("providers");
+        if (providers == null) return names;
+        JSONArray keys = providers.names();
+        if (keys == null) return names;
+        for (int i = 0; i < keys.length(); i++) {
+            names.add(keys.optString(i));
+        }
+        return names;
     }
 
     /** 切换 selector group 的当前节点。 */
@@ -284,14 +299,16 @@ public final class MihomoManager {
     static void applyNodeSelection(JSONObject config) {
         if (!isRunning()) return;
         int socks5Base = config.optInt("socks5_base_port", DEFAULT_SOCKS5_BASE_PORT);
-        List<AccountBinding> bindings = parseBindings(config, socks5Base);
+        List<Subscription> subs = parseSubscriptions(config);
+        List<AccountBinding> bindings = parseBindings(config, socks5Base, subs);
         for (AccountBinding b : bindings) {
             if (b.nodeNames.isEmpty()) continue;
             boolean switched = false;
             for (String nodeName : b.nodeNames) {
                 if (switchNode(b.groupName, nodeName)) {
                     LogStore.get().log(TAG, "账号 " + b.accountIdentifier
-                            + " → 节点: " + nodeName);
+                            + " → 订阅: " + (b.subscription != null ? b.subscription.name : "?")
+                            + " 节点: " + nodeName);
                     switched = true;
                     break;
                 }
@@ -307,10 +324,10 @@ public final class MihomoManager {
 
     /**
      * 生成 mihomo config.yaml。
-     * 使用 listeners 多入站端口隔离，每账号一个 select group（包含订阅全部节点），
-     * 启动后通过 API 切换到用户选定的主节点，避免 filter 正则的 YAML 转义问题。
+     * 支持多订阅：每个订阅一个 proxy-provider，每个账号的 select group 只 use
+     * 该账号指定的订阅 provider。启动后通过 API 切换到主节点。
      */
-    static String generateConfigYaml(String subscriptionUrl, int updateInterval,
+    static String generateConfigYaml(List<Subscription> subs, int updateInterval,
                                      int apiPort, String secret,
                                      List<AccountBinding> bindings) {
         StringBuilder sb = new StringBuilder();
@@ -321,27 +338,26 @@ public final class MihomoManager {
         sb.append("external-controller: 127.0.0.1:").append(apiPort).append("\n");
         sb.append("secret: '").append(escapeYamlSingle(secret)).append("'\n\n");
 
-        // 订阅源（URL 用单引号，避免反斜杠被解释为转义）
+        // 多订阅源
         sb.append("proxy-providers:\n");
-        sb.append("  airport:\n");
-        sb.append("    type: http\n");
-        sb.append("    url: '").append(escapeYamlSingle(subscriptionUrl)).append("'\n");
-        sb.append("    interval: ").append(updateInterval).append("\n");
-        sb.append("    path: ./providers/airport.yaml\n");
-        sb.append("    health-check:\n");
-        sb.append("      enable: true\n");
-        sb.append("      url: https://chat.deepseek.com/\n");
-        sb.append("      interval: 300\n\n");
+        for (Subscription sub : subs) {
+            sb.append("  ").append(sub.providerName).append(":\n");
+            sb.append("    type: http\n");
+            sb.append("    url: '").append(escapeYamlSingle(sub.url)).append("'\n");
+            sb.append("    interval: ").append(updateInterval).append("\n");
+            sb.append("    path: ./providers/").append(sub.providerName).append(".yaml\n");
+            sb.append("    health-check:\n");
+            sb.append("      enable: true\n");
+            sb.append("      url: https://chat.deepseek.com/\n");
+            sb.append("      interval: 300\n\n");
+        }
 
-        // 每账号一个 selector group：包含订阅全部节点，启动后通过 API 切到主节点。
-        // 不使用 filter：filter 正则需精确匹配节点名，Pattern.quote 会产生 \Q\E
-        // 反斜杠，mihomo 的 YAML 解析器在单/双引号中都会尝试解释转义导致启动失败。
-        // 改用 select + API 切换，既规避转义问题，又能灵活切换主备节点。
+        // 每账号一个 selector group，只 use 该账号指定的订阅 provider
         sb.append("proxy-groups:\n");
         for (AccountBinding b : bindings) {
             sb.append("  - name: ").append(b.groupName).append("\n");
             sb.append("    type: select\n");
-            sb.append("    use: [airport]\n\n");
+            sb.append("    use: [").append(b.subscription != null ? b.subscription.providerName : "DIRECT").append("]\n\n");
         }
 
         // 多入站端口隔离
@@ -354,7 +370,7 @@ public final class MihomoManager {
             sb.append("    proxy: ").append(b.groupName).append("\n");
         }
 
-        // 基本规则：未匹配的流量直连（listeners 已隔离账号流量，这里兜底）
+        // 基本规则
         sb.append("\nrules:\n");
         sb.append("  - MATCH,DIRECT\n");
 
@@ -392,7 +408,35 @@ public final class MihomoManager {
 
     // ========== 内部工具 ==========
 
-    private static List<AccountBinding> parseBindings(JSONObject config, int socks5Base) {
+    /** 解析订阅列表，支持新格式 subscriptions 数组 + 兼容旧版单订阅字段。 */
+    private static List<Subscription> parseSubscriptions(JSONObject config) {
+        List<Subscription> list = new ArrayList<>();
+        JSONArray arr = config.optJSONArray("subscriptions");
+        if (arr != null) {
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject s = arr.optJSONObject(i);
+                if (s == null) continue;
+                String url = s.optString("url", "").trim();
+                if (url.isEmpty()) continue;
+                String name = s.optString("name", "").trim();
+                if (name.isEmpty()) name = "订阅" + (i + 1);
+                boolean enabled = s.optBoolean("enabled", true);
+                if (!enabled) continue;
+                list.add(new Subscription(name, url, i));
+            }
+        }
+        // 兼容旧版单订阅字段
+        if (list.isEmpty()) {
+            String oldUrl = config.optString("subscription_url", "").trim();
+            if (!oldUrl.isEmpty()) {
+                list.add(new Subscription("默认订阅", oldUrl, 0));
+            }
+        }
+        return list;
+    }
+
+    private static List<AccountBinding> parseBindings(JSONObject config, int socks5Base,
+                                                       List<Subscription> subs) {
         List<AccountBinding> list = new ArrayList<>();
         JSONArray arr = config.optJSONArray("account_bindings");
         if (arr == null) return list;
@@ -409,9 +453,20 @@ public final class MihomoManager {
                     if (!n.isEmpty()) nodeNames.add(n);
                 }
             }
+            // 查找该账号指定的订阅
+            String subName = b.optString("subscription_name", "").trim();
+            Subscription sub = null;
+            if (!subName.isEmpty()) {
+                for (Subscription s : subs) {
+                    if (s.name.equals(subName)) { sub = s; break; }
+                }
+            }
+            // 旧版无 subscription_name：默认用第一个订阅
+            if (sub == null && !subs.isEmpty()) sub = subs.get(0);
+
             int currentIdx = b.optInt("current_node_index", 0);
             list.add(new AccountBinding(identifier, nodeNames, currentIdx,
-                    socks5Base + i, i));
+                    socks5Base + i, i, sub));
         }
         return list;
     }
@@ -459,17 +514,40 @@ public final class MihomoManager {
      */
     static int testNodeDelay(String nodeName) {
         if (!isRunning()) return -1;
+        HttpURLConnection c = null;
         try {
-            String encoded = java.net.URLEncoder.encode(nodeName, "UTF-8");
+            // URLEncoder.encode 把空格编码为 +，但 URL 路径段中 + 是字面量，需替换为 %20
+            String encoded = java.net.URLEncoder.encode(nodeName, "UTF-8").replace("+", "%20");
             String path = "/proxies/" + encoded + "/delay?url=https%3A%2F%2Fchat.deepseek.com%2F&timeout=5000";
-            JSONObject resp = apiGet(path);
-            if (resp != null) {
-                return resp.optInt("delay", -1);
+            URL url = new URL("http://127.0.0.1:" + apiPort + path);
+            c = (HttpURLConnection) url.openConnection(java.net.Proxy.NO_PROXY);
+            c.setConnectTimeout(3000);
+            c.setReadTimeout(8000);  // 必须大于 delay timeout(5s)，否则 HTTP 先超时
+            c.setRequestMethod("GET");
+            if (!apiSecret.isEmpty()) {
+                c.setRequestProperty("Authorization", "Bearer " + apiSecret);
             }
+            int code = c.getResponseCode();
+            // mihomo 延迟测试：成功返回 200 {"delay": N}，失败返回 400+ {"message": "..."}
+            // 两种情况都要读 body
+            InputStream stream = (code >= 200 && code < 300) ? c.getInputStream() : c.getErrorStream();
+            if (stream == null) return -1;
+            byte[] data = readAll(stream);
+            JSONObject resp = new JSONObject(new String(data, StandardCharsets.UTF_8));
+            int delay = resp.optInt("delay", -1);
+            if (delay > 0) return delay;
+            // 非 200 时记录原因，方便排查
+            if (code != 200) {
+                LogStore.get().log(TAG, "延迟测试 [" + nodeName + "] HTTP " + code
+                        + ": " + resp.optString("message", ""));
+            }
+            return -1;
         } catch (Throwable t) {
             LogStore.get().log(TAG, "测试延迟失败 [" + nodeName + "]: " + t.getMessage());
+            return -1;
+        } finally {
+            if (c != null) c.disconnect();
         }
-        return -1;
     }
 
     private static boolean apiPut(String path, String body) {
@@ -519,7 +597,23 @@ public final class MihomoManager {
         return bos.toByteArray();
     }
 
-    // ========== 账号绑定数据结构 ==========
+    // ========== 数据结构 ==========
+
+    /** 一个机场订阅。 */
+    static final class Subscription {
+        final String name;       // 用户可读名称
+        final String url;        // 订阅 URL
+        final int index;         // 在配置中的序号
+        /** mihomo proxy-provider 名，用索引保证唯一且稳定。 */
+        final String providerName;
+
+        Subscription(String name, String url, int index) {
+            this.name = name;
+            this.url = url;
+            this.index = index;
+            this.providerName = "sub-" + index;
+        }
+    }
 
     static final class AccountBinding {
         final String accountIdentifier;
@@ -527,18 +621,21 @@ public final class MihomoManager {
         final int currentNodeIndex;
         final int socksPort;
         final int index;
+        final Subscription subscription;  // 该账号使用的订阅
         /** mihomo group 名，用索引保证唯一且稳定。 */
         final String groupName;
         /** ds2api Proxy ID。 */
         final String proxyId;
 
         AccountBinding(String accountIdentifier, List<String> nodeNames,
-                       int currentNodeIndex, int socksPort, int index) {
+                       int currentNodeIndex, int socksPort, int index,
+                       Subscription subscription) {
             this.accountIdentifier = accountIdentifier;
             this.nodeNames = nodeNames;
             this.currentNodeIndex = currentNodeIndex;
             this.socksPort = socksPort;
             this.index = index;
+            this.subscription = subscription;
             this.groupName = "acc-" + index;
             this.proxyId = "mihomo-" + index;
         }
