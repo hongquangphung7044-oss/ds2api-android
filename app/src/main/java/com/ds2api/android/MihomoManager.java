@@ -266,9 +266,7 @@ public final class MihomoManager {
     // ========== mihomo API 封装 ==========
 
     /**
-     * 获取指定订阅 provider 的节点名列表（已过滤广告/伪节点）。
-     * 机场常在订阅里塞广告条目（"🇦🇶 [到期:...]"、"✅中文官网：xxx"），这些不是真实代理，
-     * 不能让用户选作节点。只返回 type 为真实代理类型的节点。
+     * 获取指定订阅 provider 的节点名列表（不过滤，返回全部）。
      */
     static List<String> fetchNodeList(String providerName) {
         List<String> names = new ArrayList<>();
@@ -276,22 +274,13 @@ public final class MihomoManager {
         if (resp == null) return names;
         JSONArray proxies = resp.optJSONArray("proxies");
         if (proxies == null) return names;
-        int filtered = 0;
         for (int i = 0; i < proxies.length(); i++) {
             JSONObject node = proxies.optJSONObject(i);
             if (node == null) continue;
             String name = node.optString("name", "");
-            if (name.isEmpty()) continue;
-            String type = node.optString("type", "");
-            if (isRealProxyType(type)) {
+            if (!name.isEmpty()) {
                 names.add(name);
-            } else {
-                filtered++;
             }
-        }
-        if (filtered > 0) {
-            LogStore.get().log(TAG, "订阅 [" + providerName + "] 过滤 " + filtered
-                    + " 个广告/伪节点，保留 " + names.size() + " 个真实节点");
         }
         return names;
     }
