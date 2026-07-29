@@ -405,9 +405,8 @@ public class ServerService extends Service {
         if (!MihomoManager.probeReady()) {
             LogStore.get().log("APP", "警告: mihomo API 未就绪，代理可能不可用");
         } else {
-            // 等待订阅加载完成（首次拉取需要网络往返）
-            try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
             // 把每个账号的 selector 切换到用户选定的主节点
+            // applyNodeSelection 内部会等待 provider 节点加载完成，无需额外 sleep
             MihomoManager.applyNodeSelection(mihomo);
         }
 

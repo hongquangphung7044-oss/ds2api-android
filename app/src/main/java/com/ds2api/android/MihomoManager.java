@@ -386,23 +386,57 @@ public final class MihomoManager {
     /**
      * 启动/热重载后，通过 API 把每个账号的 selector 切换到主节点。
      * 必须在 probeReady 成功后调用。主节点失败时切到备用节点（顺位）。
+     *
+     * 关键修复：probeReady 仅检查 /version 可用，但此时 proxy-provider 可能仍在
+     * "Start initial provider" 阶段，group 引用的 provider 节点尚未加载完，
+     * group 内为空 → PUT /proxies/{group} 返回 404。
+     * 这里改为：先等待至少一个 provider 拉到节点，再执行切换；切换失败则短暂重试。
      */
     static void applyNodeSelection(JSONObject config) {
         if (!isRunning()) return;
         int socks5Base = config.optInt("socks5_base_port", DEFAULT_SOCKS5_BASE_PORT);
         List<Subscription> subs = parseSubscriptions(config);
         List<AccountBinding> bindings = parseBindings(config, socks5Base, subs);
+
+        // 1. 等待 provider 节点加载完成（最长 15s）
+        //    provider 节点未加载时 group 为空，PUT 切换必 404
+        long deadline = System.currentTimeMillis() + 15000;
+        boolean providerReady = false;
+        while (System.currentTimeMillis() < deadline) {
+            for (Subscription s : subs) {
+                List<String> nodes = fetchNodeList(s.providerName);
+                if (!nodes.isEmpty()) {
+                    providerReady = true;
+                    break;
+                }
+            }
+            if (providerReady) break;
+            try { Thread.sleep(500); } catch (InterruptedException ignored) { break; }
+        }
+        if (!providerReady) {
+            LogStore.get().log(TAG, "警告: provider 节点在 15s 内未加载完成，"
+                    + "切换节点可能失败（请检查订阅是否有效）");
+        }
+
+        // 2. 逐账号切换节点，失败则短暂重试（group 可能仍在创建中）
         for (AccountBinding b : bindings) {
             if (b.nodeNames.isEmpty()) continue;
             boolean switched = false;
             for (String nodeName : b.nodeNames) {
-                if (switchNode(b.groupName, nodeName)) {
-                    LogStore.get().log(TAG, "账号 " + b.accountIdentifier
-                            + " → 订阅: " + (b.subscription != null ? b.subscription.name : "?")
-                            + " 节点: " + nodeName);
-                    switched = true;
-                    break;
+                // 重试 3 次，间隔 800ms（应对 group/provider 异步创建）
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    if (switchNode(b.groupName, nodeName)) {
+                        LogStore.get().log(TAG, "账号 " + b.accountIdentifier
+                                + " → 订阅: " + (b.subscription != null ? b.subscription.name : "?")
+                                + " 节点: " + nodeName);
+                        switched = true;
+                        break;
+                    }
+                    if (attempt < 2) {
+                        try { Thread.sleep(800); } catch (InterruptedException ignored) { break; }
+                    }
                 }
+                if (switched) break;
             }
             if (!switched) {
                 LogStore.get().log(TAG, "警告: 账号 " + b.accountIdentifier
@@ -476,6 +510,24 @@ public final class MihomoManager {
      * @return 出口 IP 信息字符串，失败返回 null
      */
     static String verifyProxyExit(int socksPort) {
+        // 重试 3 次，间隔 1.5s：SOCKS5 端口刚监听 / group 节点切换中时可能短暂拒绝连接
+        String lastErr = "";
+        for (int attempt = 0; attempt < 3; attempt++) {
+            String result = verifyProxyExitOnce(socksPort);
+            if (result != null) return result;
+            // 记录最后一次错误用于日志
+            lastErr = lastVerifyErr;
+            if (attempt < 2) {
+                try { Thread.sleep(1500); } catch (InterruptedException ignored) { break; }
+            }
+        }
+        LogStore.get().log(TAG, "代理验证全部失败: " + lastErr);
+        return null;
+    }
+
+    private static String lastVerifyErr = "";
+
+    private static String verifyProxyExitOnce(int socksPort) {
         java.net.Proxy proxy = new java.net.Proxy(java.net.Proxy.Type.SOCKS,
                 new java.net.InetSocketAddress("127.0.0.1", socksPort));
         // 多个 IP 检测服务，依次尝试（ip-api 国内可能被墙，ip.sb/ipinfo.io 备用）
@@ -484,7 +536,6 @@ public final class MihomoManager {
                 {"https://api.ip.sb/geoip", "ip"},
                 {"https://ipinfo.io/json", "ip"}
         };
-        String lastErr = "";
         for (String[] svc : services) {
             HttpURLConnection c = null;
             try {
@@ -496,7 +547,7 @@ public final class MihomoManager {
                 c.setRequestProperty("User-Agent", "Mozilla/5.0");
                 int code = c.getResponseCode();
                 if (code != 200) {
-                    lastErr = svc[0] + " HTTP " + code;
+                    lastVerifyErr = svc[0] + " HTTP " + code;
                     continue;
                 }
                 try (InputStream in = c.getInputStream()) {
@@ -510,12 +561,11 @@ public final class MihomoManager {
                     return ip + " | " + loc + (isp.isEmpty() ? "" : " | " + isp);
                 }
             } catch (Throwable t) {
-                lastErr = svc[0] + " " + t.getClass().getSimpleName() + ": " + t.getMessage();
+                lastVerifyErr = svc[0] + " " + t.getClass().getSimpleName() + ": " + t.getMessage();
             } finally {
                 if (c != null) c.disconnect();
             }
         }
-        LogStore.get().log(TAG, "代理验证全部失败: " + lastErr);
         return null;
     }
 
