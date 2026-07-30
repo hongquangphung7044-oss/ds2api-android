@@ -1085,10 +1085,10 @@ public class ProxyConfigActivity extends Activity {
                 // 启动失败时尝试自动恢复（节点名 not found 等 fatal 错误）：
                 // 剔除报错节点后重试启动一次，避免因单个节点名不匹配导致整个 mihomo 无法启动
                 if (!ready) {
-                    boolean recovered = MihomoManager.attemptAutoRecover(mihomoConfig);
+                    boolean recovered = MihomoManager.attemptAutoRecover(this, mihomoConfig);
                     if (recovered) {
-                        ready = MihomoManager.probeReady();
-                        if (ready) writeMihomoConfig();  // 恢复改了 bindings，落盘
+                        ready = true;  // attemptAutoRecover 内部已 probeReady 成功
+                        writeMihomoConfig();  // 恢复改了 bindings，落盘
                     }
                 }
                 if (ready) {
@@ -1100,11 +1100,12 @@ public class ProxyConfigActivity extends Activity {
                     MihomoManager.injectProxiesIntoConfig(cfgFile, mihomoConfig);
                     fetchNodes();
                 }
+                final boolean finalReady = ready;
                 runOnUiThread(() -> {
                     startMihomoBtn.setEnabled(true);
                     startMihomoBtn.setText("启动 mihomo");
                     refreshMihomoStatus();
-                    if (ready) {
+                    if (finalReady) {
                         // ds2api 进程启动时一次性读 config.json，无热重载。
                         // injectProxiesIntoConfig 改了 config.json，运行中的 ds2api 需重启才生效。
                         if (ServerService.isRunning()) {
@@ -1221,12 +1222,10 @@ public class ProxyConfigActivity extends Activity {
                         // 启动失败时尝试自动恢复（节点名 not found 等 fatal 错误）：
                         // 剔除报错节点后重试启动一次，与 doStartMihomo 保持一致
                         if (!ready) {
-                            boolean recovered = MihomoManager.attemptAutoRecover(mihomoConfig);
+                            boolean recovered = MihomoManager.attemptAutoRecover(this, mihomoConfig);
                             if (recovered) {
-                                ready = MihomoManager.probeReady();
-                                if (ready) {
-                                    writeMihomoConfig();  // 恢复改了 bindings，落盘
-                                }
+                                ready = true;  // attemptAutoRecover 内部已 probeReady 成功
+                                writeMihomoConfig();  // 恢复改了 bindings，落盘
                             }
                         }
                         if (ready) {

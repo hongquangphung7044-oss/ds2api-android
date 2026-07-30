@@ -269,10 +269,12 @@ public final class MihomoManager {
      * 从 config 的 account_bindings 里剔除所有引用该节点名的 NodeRef，
      * 重新生成 config.yaml 并重启 mihomo 一次。
      * 仅当 lastConfigError 含 "not found" 时触发，避免无限循环。
+     * synchronized：与 start/stop 互斥，避免恢复期间用户点停止导致 process 竞态。
+     * @param ctx Context（用于 ensureBinary 释放/复制 libmihomo.so）
      * @param config mihomo 配置 JSON（含 subscriptions + account_bindings）
      * @return true 表示已尝试恢复（调用方应再次 probeReady）
      */
-    static boolean attemptAutoRecover(JSONObject config) {
+    static synchronized boolean attemptAutoRecover(Context ctx, JSONObject config) {
         String err = lastConfigError;
         if (err == null || !err.contains("not found") || workDir == null) {
             return false;
@@ -285,8 +287,11 @@ public final class MihomoManager {
         LogStore.get().log(TAG, "检测到 mihomo 因节点 [" + badNode + "] not found 致命退出，"
                 + "自动从账号绑定中剔除该节点并重试");
         // 从 config 的 account_bindings 剔除该节点名
+        // 注意：节点名 JSON 字段是 "name"（与 parseBindings/doSave 一致），不是 "node_name"
         JSONArray bindings = config.optJSONArray("account_bindings");
         if (bindings == null) return false;
+        // 备份原 bindings：恢复失败（仍 ready=false）时回滚，避免内存配置渐进式丢节点
+        JSONArray bindingsBackup = new JSONArray(bindings.toString());
         int removed = 0;
         for (int i = 0; i < bindings.length(); i++) {
             JSONObject b = bindings.optJSONObject(i);
@@ -297,7 +302,7 @@ public final class MihomoManager {
             for (int j = 0; j < nodes.length(); j++) {
                 JSONObject n = nodes.optJSONObject(j);
                 if (n == null) { kept.put(n); continue; }
-                String nn = n.optString("node_name", "");
+                String nn = n.optString("name", "");
                 if (!badNode.equals(nn)) {
                     kept.put(n);
                 } else {
@@ -335,15 +340,30 @@ public final class MihomoManager {
             try (OutputStream out = new FileOutputStream(configFile)) {
                 out.write(yaml.getBytes(StandardCharsets.UTF_8));
             }
-            // 清空错误标记，重置进程状态后重启
+            // 清空错误标记，重启前先销毁可能存活的旧进程（fatal 后通常已退出，但兜底防端口冲突）
             lastConfigError = null;
-            process = null;
             lastExitCode = -1;
+            Process stale = process;
+            if (stale != null && stale.isAlive()) {
+                try { stale.destroy(); stale.waitFor(2, java.util.concurrent.TimeUnit.SECONDS); }
+                catch (Throwable ignored) {}
+                try { if (stale.isAlive()) stale.destroyForcibly(); } catch (Throwable ignored) {}
+            }
+            process = null;
             // 复用 start 的进程启动逻辑（不重新下载订阅）
-            restartProcessOnly();
+            restartProcessOnly(ctx);
+            // 探测就绪：失败则回滚内存中的 bindings 剔除，避免下次启动用被修剪的配置
+            // （磁盘未被调用方落盘，但内存 mihomoConfig 已被改，必须还原）
+            if (!probeReady()) {
+                LogStore.get().log(TAG, "自动恢复后仍就绪失败，回滚 account_bindings 改动");
+                config.put("account_bindings", bindingsBackup);
+                return false;
+            }
             return true;
         } catch (Throwable t) {
             LogStore.get().log(TAG, "自动恢复失败: " + t.getMessage());
+            // 异常时也回滚，防止内存配置被部分修剪
+            try { config.put("account_bindings", bindingsBackup); } catch (Throwable ignored) {}
             return false;
         }
     }
@@ -365,9 +385,9 @@ public final class MihomoManager {
     }
 
     /** 仅重启 mihomo 子进程（不重新下载订阅/不重算端口），用于自动恢复。 */
-    private static void restartProcessOnly() throws Exception {
+    private static void restartProcessOnly(Context ctx) throws Exception {
         File configFile = new File(workDir, "config.yaml");
-        String binPath = ensureBinary(android.app.AppGlobals.getInitialApplication());
+        String binPath = ensureBinary(ctx);
         ProcessBuilder pb = new ProcessBuilder(binPath, "-d", workDir.getAbsolutePath(),
                 "-f", configFile.getAbsolutePath());
         pb.directory(workDir);
@@ -639,126 +659,42 @@ public final class MihomoManager {
     }
 
     /**
-     * 从 mihomo proxy-provider yaml 文件提取节点名。
-     * 支持三种订阅格式（与 isValidSubscriptionContent 一致）：
-     * 1. clash YAML：扫描 proxies: 段下 - name: 行
-     * 2. base64 编码的 share link 列表：先解码
-     * 3. 明文 share link 列表：ss/vmess/trojan/vless/hysteria2/hy2/tuic
-     * 节点名提取规则：share link # 后的 fragment（URL decode）；
-     *                vmess:// 是 base64(JSON)，取 JSON 的 ps 字段；
-     *                无 #/ps 的取协议头+host 作为兜底名（mihomo 自行命名规则）。
-     * 覆盖全部格式后，filterBindingsByProviderNodes 能可靠过滤过期节点名，
-     * 避免机场改名/下架后 binding 引用不存在节点导致 mihomo 整个 config 加载失败。
+     * 从 mihomo proxy-provider yaml 文件提取节点名（扫描 proxies: 段下的 - name: 行）。
+     * 仅解析 clash YAML 格式（FlClash/clash UA 拿到的标准格式，节点名完整可靠）。
+     * 非 YAML 格式（base64/share link）返回空集合 → filterBindingsByProviderNodes
+     * 走"保留全部"分支，不做过滤（避免本地提取不完整误删有效节点导致代理静默失效）；
+     * 此类订阅的过期节点由 attemptAutoRecover 解析 mihomo 真实 fatal 错误后兜底剔除。
      */
     private static java.util.Set<String> parseProxyNamesFromFile(File f) {
         java.util.Set<String> names = new java.util.HashSet<>();
         if (!f.exists()) return names;
-        String body;
         try (BufferedReader br = new BufferedReader(
                 new InputStreamReader(new java.io.FileInputStream(f), StandardCharsets.UTF_8))) {
-            StringBuilder sb = new StringBuilder();
             String line;
+            boolean inProxies = false;
             while ((line = br.readLine()) != null) {
-                sb.append(line).append('\n');
-            }
-            body = sb.toString();
-        } catch (Throwable ignored) {
-            return names;
-        }
-        names.addAll(parseClashYamlNames(body));
-        if (!names.isEmpty()) return names;  // clash YAML 已解析出节点名，无需再试 share link
-        names.addAll(parseShareLinkNames(body));
-        return names;
-    }
-
-    /** 解析 clash YAML 格式订阅的节点名（扫描 proxies: 段下 - name: 行）。 */
-    private static java.util.Set<String> parseClashYamlNames(String body) {
-        java.util.Set<String> names = new java.util.HashSet<>();
-        boolean inProxies = false;
-        for (String line : body.split("\n", -1)) {
-            String trimmed = line.trim();
-            if (trimmed.equals("proxies:")) { inProxies = true; continue; }
-            if (inProxies) {
-                if (!line.isEmpty() && !line.startsWith(" ") && !line.startsWith("-")) {
-                    inProxies = false;
-                    continue;
-                }
-                if (trimmed.startsWith("- name:")) {
-                    String val = trimmed.substring("- name:".length()).trim();
-                    if (val.length() >= 2
-                            && ((val.startsWith("\"") && val.endsWith("\""))
-                            || (val.startsWith("'") && val.endsWith("'")))) {
-                        val = val.substring(1, val.length() - 1);
+                String trimmed = line.trim();
+                if (trimmed.equals("proxies:")) { inProxies = true; continue; }
+                if (inProxies) {
+                    // proxies 段结束：遇到非缩进的非空行且不是列表项
+                    if (!line.isEmpty() && !line.startsWith(" ") && !line.startsWith("-")) {
+                        inProxies = false;
+                        continue;
                     }
-                    if (!val.isEmpty()) names.add(val);
+                    if (trimmed.startsWith("- name:")) {
+                        String val = trimmed.substring("- name:".length()).trim();
+                        // 去引号
+                        if (val.length() >= 2
+                                && ((val.startsWith("\"") && val.endsWith("\""))
+                                || (val.startsWith("'") && val.endsWith("'")))) {
+                            val = val.substring(1, val.length() - 1);
+                        }
+                        if (!val.isEmpty()) names.add(val);
+                    }
                 }
             }
-        }
+        } catch (Throwable ignored) {}
         return names;
-    }
-
-    /**
-     * 解析 share link 列表格式订阅的节点名（支持 base64 编码与明文）。
-     * 节点名来源优先级：
-     *   1. ss/trojan/vless/hy2/tuic 等：URL # 后的 fragment（URL decode）
-     *   2. vmess://：base64 解码后的 JSON 的 ps 字段
-     *   3. 无 #/ps：返回空（mihomo 会用 host:port 自动命名，但本地难以精确还原，
-     *      为避免误过滤保留空集，让 filterBindingsByProviderNodes 走"非 YAML 保留"分支）
-     */
-    private static java.util.Set<String> parseShareLinkNames(String body) {
-        java.util.Set<String> names = new java.util.HashSet<>();
-        if (body == null || body.isEmpty()) return names;
-        String text = body.trim();
-        // 尝试 base64 解码（标准 + URL-safe 两种）
-        if (!text.contains("://") && !text.contains("proxies:")) {
-            String decoded = null;
-            try {
-                decoded = new String(java.util.Base64.getDecoder().decode(text.replaceAll("\\s+", "")),
-                        StandardCharsets.UTF_8);
-            } catch (Throwable ignored) {
-                try {
-                    decoded = new String(java.util.Base64.getUrlDecoder().decode(text.replaceAll("\\s+", "")),
-                            StandardCharsets.UTF_8);
-                } catch (Throwable ignored2) { /* 非 base64，按明文处理 */ }
-            }
-            if (decoded != null && decoded.contains("://")) text = decoded;
-        }
-        // 逐行解析 share link
-        for (String raw : text.split("\\r?\\n")) {
-            String link = raw.trim();
-            if (link.isEmpty() || !link.contains("://")) continue;
-            String name = extractShareLinkName(link);
-            if (name != null && !name.isEmpty()) names.add(name);
-        }
-        return names;
-    }
-
-    /** 从单个 share link 提取节点名（# fragment 或 vmess ps 字段）。 */
-    private static String extractShareLinkName(String link) {
-        try {
-            if (link.startsWith("vmess://")) {
-                // vmess://base64(JSON)，JSON 含 ps 字段
-                String payload = link.substring("vmess://".length()).trim();
-                byte[] json;
-                try {
-                    json = java.util.Base64.getDecoder().decode(payload);
-                } catch (Throwable ignored) {
-                    json = java.util.Base64.getUrlDecoder().decode(payload);
-                }
-                JSONObject obj = new JSONObject(new String(json, StandardCharsets.UTF_8));
-                return obj.optString("ps", obj.optString("remarks", ""));
-            }
-            // 其他协议：# 后的 fragment 为节点名（URL encoded）
-            int hash = link.indexOf('#');
-            if (hash < 0 || hash == link.length() - 1) return null;
-            String frag = link.substring(hash + 1);
-            // 去掉可能的查询参数（部分协议在 fragment 后还带 ?xxx）
-            int q = frag.indexOf('?');
-            if (q >= 0) frag = frag.substring(0, q);
-            return java.net.URLDecoder.decode(frag, StandardCharsets.UTF_8.name());
-        } catch (Throwable t) {
-            return null;
-        }
     }
 
     /**
