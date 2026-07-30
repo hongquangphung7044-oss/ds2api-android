@@ -340,7 +340,7 @@ public final class MihomoManager {
         return names;
     }
 
-    /** 切换 selector group 的当前节点。 */
+    /** 切换 group 的当前节点（fallback group 用于固定首选，失败由 fallback 自动兜底）。 */
     static boolean switchNode(String groupName, String nodeName) {
         HttpURLConnection c = null;
         try {
@@ -393,13 +393,13 @@ public final class MihomoManager {
     }
 
     /**
-     * 启动/热重载后，通过 API 把每个账号的 selector 切换到主节点。
-     * 必须在 probeReady 成功后调用。主节点失败时切到备用节点（顺位）。
+     * 启动/热重载后，尝试把每个账号切换到用户选定的主节点。
      *
-     * 关键修复：probeReady 仅检查 /version 可用，但此时 proxy-provider 可能仍在
-     * "Start initial provider" 阶段，group 引用的 provider 节点尚未加载完，
-     * group 内为空 → PUT /proxies/{group} 返回 404。
-     * 这里改为：先等待至少一个 provider 拉到节点，再执行切换；切换失败则短暂重试。
+     * group 现为 fallback 类型：内核按 proxies 列表顺序自动选第一个可用节点，
+     * 当前节点连接失败时自动即时切换到下一个（内核级故障转移）。
+     * 这里仍尝试 PUT 切换到用户选的主节点（nodes[0]）以固定首选；
+     * 若 mihomo fallback 不支持固定选择，PUT 失败无害——fallback 自动管理。
+     * fallback 的 lazy healthcheck 在对话时探活，主节点恢复后自动切回。
      */
     static void applyNodeSelection(JSONObject config) {
         if (!isRunning()) return;
@@ -424,32 +424,31 @@ public final class MihomoManager {
         }
         if (!providerReady) {
             LogStore.get().log(TAG, "警告: provider 节点在 15s 内未加载完成，"
-                    + "切换节点可能失败（请检查订阅是否有效）");
+                    + "fallback 将在节点加载后自动选择（请检查订阅是否有效）");
         }
 
-        // 2. 逐账号切换节点，失败则顺位切到下一个备用节点（group 可能仍在创建中）
+        // 2. 逐账号尝试切换到用户选的主节点（nodes[0]）
+        //    fallback group 自动管理，这里只尝试固定首选；失败由 fallback 兜底
         for (AccountBinding b : bindings) {
             if (b.nodes.isEmpty()) continue;
+            NodeRef primary = b.nodes.get(0);
             boolean switched = false;
-            for (NodeRef ref : b.nodes) {
-                // 重试 3 次，间隔 800ms（应对 group/provider 异步创建）
-                for (int attempt = 0; attempt < 3; attempt++) {
-                    if (switchNode(b.groupName, ref.nodeName)) {
-                        LogStore.get().log(TAG, "账号 " + b.accountIdentifier
-                                + " → 订阅: " + ref.subscriptionName
-                                + " 节点: " + ref.nodeName);
-                        switched = true;
-                        break;
-                    }
-                    if (attempt < 2) {
-                        try { Thread.sleep(800); } catch (InterruptedException ignored) { break; }
-                    }
+            for (int attempt = 0; attempt < 3; attempt++) {
+                if (switchNode(b.groupName, primary.nodeName)) {
+                    LogStore.get().log(TAG, "账号 " + b.accountIdentifier
+                            + " → 主节点: " + primary.nodeName
+                            + "（fallback 故障转移已启用，主节点失效自动切备用）");
+                    switched = true;
+                    break;
                 }
-                if (switched) break;
+                if (attempt < 2) {
+                    try { Thread.sleep(800); } catch (InterruptedException ignored) { break; }
+                }
             }
             if (!switched) {
-                LogStore.get().log(TAG, "警告: 账号 " + b.accountIdentifier
-                        + " 切换节点全部失败（订阅可能失效或节点未加载）");
+                // PUT 失败不影响功能：fallback 自动选第一个可用节点
+                LogStore.get().log(TAG, "账号 " + b.accountIdentifier
+                        + " 主节点固定未生效（fallback 将自动选择可用节点）");
             }
         }
     }
@@ -470,7 +469,8 @@ public final class MihomoManager {
         sb.append("# 自动生成，请勿手动编辑\n");
         sb.append("allow-lan: false\n");
         sb.append("mode: rule\n");
-        sb.append("log-level: info\n");
+        // log-level: warning 减少日志 IO 耗电（info 级每请求都有日志行）
+        sb.append("log-level: warning\n");
         sb.append("external-controller: 127.0.0.1:").append(apiPort).append("\n");
         sb.append("secret: '").append(escapeYamlSingle(secret)).append("'\n\n");
 
@@ -478,6 +478,8 @@ public final class MihomoManager {
         // 关键：用 type: file，订阅文件由 App 层（downloadSubscription）下载。
         // 借鉴 FlClash：App 层下载能自由控制 UA/重试/超时，绕过机场对 mihomo
         // 内置 http provider 的 UA 拦截（很多机场对 mihomo/clash 默认 UA 返回 403）。
+        // provider health-check interval 设 86400（24h）：几乎不自动定时探活省电；
+        // 手动"测试延迟"调用 /providers/proxies/{name}/healthcheck 是强制触发，不受 interval 影响。
         sb.append("proxy-providers:\n");
         for (Subscription sub : subs) {
             sb.append("  ").append(sub.providerName).append(":\n");
@@ -486,7 +488,7 @@ public final class MihomoManager {
             sb.append("    health-check:\n");
             sb.append("      enable: true\n");
             sb.append("      url: http://www.gstatic.com/generate_204\n");
-            sb.append("      interval: 300\n\n");
+            sb.append("      interval: 86400\n\n");
         }
 
         // 订阅名 → provider 名映射，便于按账号节点涉及的订阅查找 provider
@@ -495,29 +497,36 @@ public final class MihomoManager {
             subNameToProvider.put(sub.name, sub.providerName);
         }
 
-        // 每账号一个 selector group，use 该账号涉及且下载成功的订阅 provider
-        // 容错：若该账号所有订阅都失效，回退为 proxies: [DIRECT]，避免空 group 报错
+        // 每账号一个 fallback group：
+        // - type: fallback 按节点列表顺序使用，当前节点连接失败时自动即时切换到下一个（内核级故障转移）
+        // - proxies: 用户选的节点名按优先级（主→备用1→备用2），跨订阅混合
+        // - health-check lazy: true 只在 group 有流量经过时才探活（对话时探测，息屏零探活省电）
+        // - interval: 600 lazy 模式下每 10 分钟最多探活一次
+        // - 主节点恢复后 fallback 自动切回主节点
+        // 容错：若该账号无有效节点，回退为 proxies: [DIRECT]，避免空 group 报错
         sb.append("proxy-groups:\n");
         for (AccountBinding b : bindings) {
             sb.append("  - name: ").append(b.groupName).append("\n");
-            sb.append("    type: select\n");
-            // 收集该账号涉及且下载成功的 provider 名（去重保序）
-            List<String> useProviders = new ArrayList<>();
-            for (String subName : b.subscriptionNames) {
-                String pn = subNameToProvider.get(subName);
-                if (pn != null && !useProviders.contains(pn)) useProviders.add(pn);
-            }
-            if (!useProviders.isEmpty()) {
-                sb.append("    use: [");
-                for (int k = 0; k < useProviders.size(); k++) {
+            sb.append("    type: fallback\n");
+            if (!b.nodes.isEmpty()) {
+                // 用 proxies 明确引用用户选的节点（按优先级），跨订阅混合
+                // 节点名来自 provider，mihomo 加载 provider 后节点名全局可见
+                sb.append("    proxies: [");
+                for (int k = 0; k < b.nodes.size(); k++) {
                     if (k > 0) sb.append(", ");
-                    sb.append(useProviders.get(k));
+                    sb.append("'").append(escapeYamlSingle(b.nodes.get(k).nodeName)).append("'");
                 }
                 sb.append("]\n");
             } else {
-                // 所有订阅都失效：用 DIRECT 兜底，保证配置能加载、端口能监听
+                // 无有效节点：用 DIRECT 兜底，保证配置能加载、端口能监听
                 sb.append("    proxies: [DIRECT]\n");
             }
+            // lazy healthcheck：只在 group 被使用（有流量）时探活，息屏无对话不探活
+            sb.append("    health-check:\n");
+            sb.append("      enable: true\n");
+            sb.append("      lazy: true\n");
+            sb.append("      url: http://www.gstatic.com/generate_204\n");
+            sb.append("      interval: 600\n");
             sb.append("\n");
         }
 
