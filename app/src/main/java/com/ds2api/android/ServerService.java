@@ -429,9 +429,21 @@ public class ServerService extends Service {
         // 死代理写进 config.json，导致 ds2api 所有请求 ECONNREFUSED。改为：未就绪
         // 时清理死代理条目并跳过注入，让 ds2api 直连运行。
         if (!MihomoManager.probeReady()) {
-            LogStore.get().log("APP", "警告: mihomo API 未就绪，清理死代理条目，ds2api 直连运行");
-            MihomoManager.clearProxiesFromConfig(configFile);
-            return;
+            // 启动失败时尝试自动恢复（节点名 not found 等 fatal 错误）：
+            // 循环剔除失效节点后重试启动，避免因部分节点名不匹配导致整个 mihomo 无法启动、
+            // 所有账号代理失效。恢复成功则落盘更新后的 mihomo_config.json 并继续正常流程。
+            boolean recovered = MihomoManager.attemptAutoRecover(this, mihomo);
+            if (recovered) {
+                try {
+                    atomicWrite(mihomoFile, mihomo.toString(2).getBytes(StandardCharsets.UTF_8));
+                } catch (Throwable t) {
+                    LogStore.get().log("APP", "持久化恢复后的 mihomo_config.json 失败（不影响本次运行）: " + t.getMessage());
+                }
+            } else {
+                LogStore.get().log("APP", "警告: mihomo API 未就绪且自动恢复失败，清理死代理条目，ds2api 直连运行");
+                MihomoManager.clearProxiesFromConfig(configFile);
+                return;
+            }
         }
         // 把每个账号的 selector 切换到用户选定的主节点
         // applyNodeSelection 内部会等待 provider 节点加载完成，无需额外 sleep

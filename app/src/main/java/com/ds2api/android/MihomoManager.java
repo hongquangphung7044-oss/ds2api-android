@@ -275,103 +275,112 @@ public final class MihomoManager {
      * @return true 表示已尝试恢复（调用方应再次 probeReady）
      */
     static synchronized boolean attemptAutoRecover(Context ctx, JSONObject config) {
-        String err = lastConfigError;
-        if (err == null || !err.contains("not found") || workDir == null) {
-            return false;
-        }
-        // 提取 fatal 日志里的节点名：格式 "...: '节点名' not found" 或 "...: \"节点名\" not found"
-        String badNode = extractQuotedBefore(err, "not found");
-        if (badNode == null || badNode.isEmpty()) {
-            return false;
-        }
-        LogStore.get().log(TAG, "检测到 mihomo 因节点 [" + badNode + "] not found 致命退出，"
-                + "自动从账号绑定中剔除该节点并重试");
-        // 从 config 的 account_bindings 剔除该节点名
-        // 注意：节点名 JSON 字段是 "name"（与 parseBindings/doSave 一致），不是 "node_name"
-        JSONArray bindings = config.optJSONArray("account_bindings");
-        if (bindings == null) return false;
-        // 备份原 bindings：恢复失败（仍 ready=false）时回滚，避免内存配置渐进式丢节点
-        final JSONArray bindingsBackup;
-        int removed = 0;
-        try {
-            bindingsBackup = new JSONArray(bindings.toString());
-            for (int i = 0; i < bindings.length(); i++) {
-                JSONObject b = bindings.optJSONObject(i);
-                if (b == null) continue;
-                JSONArray nodes = b.optJSONArray("nodes");
-                if (nodes == null) continue;
-                JSONArray kept = new JSONArray();
-                for (int j = 0; j < nodes.length(); j++) {
-                    JSONObject n = nodes.optJSONObject(j);
-                    if (n == null) { kept.put(n); continue; }
-                    String nn = n.optString("name", "");
-                    if (!badNode.equals(nn)) {
-                        kept.put(n);
-                    } else {
-                        removed++;
-                    }
-                }
-                b.put("nodes", kept);
+        if (workDir == null) return false;
+        // 循环剔除失效节点：mihomo 一次 fatal 只报一个不存在的节点名，
+        // config 里可能有多个失效引用（机场批量改名/下架），需逐个剔除重启。
+        // 最多 20 轮，防止异常情况下死循环。失效节点删除是正确修复，不回滚
+        // （回滚会让下次启动重复同样错误）。
+        final int MAX_ROUNDS = 20;
+        for (int round = 0; round < MAX_ROUNDS; round++) {
+            String err = lastConfigError;
+            if (err == null || !err.contains("not found")) {
+                // 无 not found 错误：若进程在跑且 API 就绪则成功，否则放弃
+                return isRunning() && probeReady();
             }
-        } catch (org.json.JSONException je) {
-            LogStore.get().log(TAG, "剔除节点 [" + badNode + "] 时 JSON 异常: " + je.getMessage());
-            return false;
-        }
-        if (removed == 0) {
-            LogStore.get().log(TAG, "未在 account_bindings 找到节点 [" + badNode + "]，放弃恢复");
-            return false;
-        }
-        LogStore.get().log(TAG, "已从 account_bindings 剔除 " + removed + " 个引用 ["
-                + badNode + "] 的节点");
-        // 重新生成 config.yaml 并重启
-        try {
-            List<Subscription> subs = parseSubscriptions(config);
-            File providersDir = new File(workDir, "providers");
-            int socks5Base = config.optInt("socks5_base_port", socks5BasePort);
-            int updateInterval = config.optInt("subscription_update_interval", 3600);
-            List<AccountBinding> okBindings = parseBindings(config, socks5Base, subs);
-            // 只用已存在的 provider 文件（不重新下载，订阅没变）
-            List<Subscription> okSubs = new ArrayList<>();
-            for (Subscription sub : subs) {
-                if (new File(providersDir, sub.providerName + ".yaml").exists()) {
-                    okSubs.add(sub);
-                }
-            }
-            java.util.Map<String, java.util.Set<String>> providerNodeNames =
-                    parseProviderNodeNames(providersDir, okSubs);
-            List<AccountBinding> filteredBindings =
-                    filterBindingsByProviderNodes(okBindings, providerNodeNames);
-            String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, filteredBindings);
-            File configFile = new File(workDir, "config.yaml");
-            try (OutputStream out = new FileOutputStream(configFile)) {
-                out.write(yaml.getBytes(StandardCharsets.UTF_8));
-            }
-            // 清空错误标记，重启前先销毁可能存活的旧进程（fatal 后通常已退出，但兜底防端口冲突）
-            lastConfigError = null;
-            lastExitCode = -1;
-            Process stale = process;
-            if (stale != null && stale.isAlive()) {
-                try { stale.destroy(); stale.waitFor(2, java.util.concurrent.TimeUnit.SECONDS); }
-                catch (Throwable ignored) {}
-                try { if (stale.isAlive()) stale.destroyForcibly(); } catch (Throwable ignored) {}
-            }
-            process = null;
-            // 复用 start 的进程启动逻辑（不重新下载订阅）
-            restartProcessOnly(ctx);
-            // 探测就绪：失败则回滚内存中的 bindings 剔除，避免下次启动用被修剪的配置
-            // （磁盘未被调用方落盘，但内存 mihomoConfig 已被改，必须还原）
-            if (!probeReady()) {
-                LogStore.get().log(TAG, "自动恢复后仍就绪失败，回滚 account_bindings 改动");
-                config.put("account_bindings", bindingsBackup);
+            String badNode = extractQuotedBefore(err, "not found");
+            if (badNode == null || badNode.isEmpty()) {
+                LogStore.get().log(TAG, "无法从 fatal 日志提取节点名，放弃恢复: " + err);
                 return false;
             }
-            return true;
-        } catch (Throwable t) {
-            LogStore.get().log(TAG, "自动恢复失败: " + t.getMessage());
-            // 异常时也回滚，防止内存配置被部分修剪
-            try { config.put("account_bindings", bindingsBackup); } catch (Throwable ignored) {}
-            return false;
+            LogStore.get().log(TAG, "[恢复轮 " + (round + 1) + "] 检测到节点 [" + badNode
+                    + "] not found，从 account_bindings 剔除");
+            // 从 config.account_bindings 剔除该节点名（字段 "name"，与 parseBindings/doSave 一致）
+            JSONArray bindings = config.optJSONArray("account_bindings");
+            if (bindings == null) return false;
+            int removed = 0;
+            try {
+                for (int i = 0; i < bindings.length(); i++) {
+                    JSONObject b = bindings.optJSONObject(i);
+                    if (b == null) continue;
+                    JSONArray nodes = b.optJSONArray("nodes");
+                    if (nodes == null) continue;
+                    JSONArray kept = new JSONArray();
+                    for (int j = 0; j < nodes.length(); j++) {
+                        JSONObject n = nodes.optJSONObject(j);
+                        if (n == null) { kept.put(n); continue; }
+                        String nn = n.optString("name", "");
+                        if (!badNode.equals(nn)) {
+                            kept.put(n);
+                        } else {
+                            removed++;
+                        }
+                    }
+                    b.put("nodes", kept);
+                }
+            } catch (org.json.JSONException je) {
+                LogStore.get().log(TAG, "剔除节点 [" + badNode + "] JSON 异常: " + je.getMessage());
+                return false;
+            }
+            if (removed == 0) {
+                LogStore.get().log(TAG, "未在 account_bindings 找到节点 [" + badNode
+                        + "]（可能是 mihomo 内部引用），放弃恢复");
+                return false;
+            }
+            LogStore.get().log(TAG, "[恢复轮 " + (round + 1) + "] 已剔除 " + removed
+                    + " 个引用 [" + badNode + "] 的节点");
+            // 重新生成 config.yaml 并重启
+            try {
+                List<Subscription> subs = parseSubscriptions(config);
+                File providersDir = new File(workDir, "providers");
+                int socks5Base = config.optInt("socks5_base_port", socks5BasePort);
+                int updateInterval = config.optInt("subscription_update_interval", 3600);
+                List<AccountBinding> okBindings = parseBindings(config, socks5Base, subs);
+                List<Subscription> okSubs = new ArrayList<>();
+                for (Subscription sub : subs) {
+                    if (new File(providersDir, sub.providerName + ".yaml").exists()) {
+                        okSubs.add(sub);
+                    }
+                }
+                java.util.Map<String, java.util.Set<String>> providerNodeNames =
+                        parseProviderNodeNames(providersDir, okSubs);
+                List<AccountBinding> filteredBindings =
+                        filterBindingsByProviderNodes(okBindings, providerNodeNames);
+                String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, filteredBindings);
+                File configFile = new File(workDir, "config.yaml");
+                try (OutputStream out = new FileOutputStream(configFile)) {
+                    out.write(yaml.getBytes(StandardCharsets.UTF_8));
+                }
+                // 重启前销毁可能存活的旧进程，清空错误标记等下一轮重新采集
+                lastConfigError = null;
+                lastExitCode = -1;
+                Process stale = process;
+                if (stale != null && stale.isAlive()) {
+                    try { stale.destroy(); stale.waitFor(2, java.util.concurrent.TimeUnit.SECONDS); }
+                    catch (Throwable ignored) {}
+                    try { if (stale.isAlive()) stale.destroyForcibly(); } catch (Throwable ignored) {}
+                }
+                process = null;
+                restartProcessOnly(ctx);
+                // 等待 fatal 日志采集或 API 就绪。fatal 进程会很快退出，但日志线程
+                // 异步读取 stdout，lastConfigError 可能晚于进程退出才被赋值。
+                // 先等最多 2 秒让 fatal 日志落地，再 probeReady；若进程存活则直接 probe。
+                for (int w = 0; w < 20 && isRunning() && lastConfigError == null; w++) {
+                    try { Thread.sleep(100); } catch (InterruptedException ie) { break; }
+                }
+                if (probeReady()) {
+                    LogStore.get().log(TAG, "[恢复轮 " + (round + 1) + "] mihomo 已就绪 ✓");
+                    return true;
+                }
+                // probeReady 失败：若 lastConfigError 又是 not found，循环剔除下一个；
+                // 否则（其他错误/无错误）放弃
+                LogStore.get().log(TAG, "[恢复轮 " + (round + 1) + "] 仍未就绪，检查是否有更多失效节点");
+            } catch (Throwable t) {
+                LogStore.get().log(TAG, "[恢复轮 " + (round + 1) + "] 恢复异常: " + t.getMessage());
+                return false;
+            }
         }
+        LogStore.get().log(TAG, "已达最大恢复轮次 " + MAX_ROUNDS + "，放弃");
+        return false;
     }
 
     /** 从 fatal 日志提取 'not found' 前引号内的节点名。 */
