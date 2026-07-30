@@ -48,6 +48,8 @@ public final class MihomoManager {
     private static volatile File workDir;
     /** 上次退出码：-100 从未启动，-1 启动中/运行中，>=0 已退出。 */
     private static volatile int lastExitCode = -100;
+    /** 上次 mihomo fatal 配置错误日志（节点 not found 等），供自动恢复解析。 */
+    private static volatile String lastConfigError = null;
 
     private MihomoManager() {}
 
@@ -103,6 +105,7 @@ public final class MihomoManager {
         }
         workDir = mihomoWorkDir;
         workDir.mkdirs();
+        lastConfigError = null;  // 清空上次错误，本次启动重新记录
 
         // 解析配置
         enabled = true;
@@ -259,6 +262,136 @@ public final class MihomoManager {
         LogStore.get().log(TAG, "警告: " + (READY_PROBE_TIMEOUT_MS / 1000)
                 + " 秒内未检测到 API 就绪");
         return false;
+    }
+
+    /**
+     * mihomo 启动失败后尝试自动恢复：解析 fatal 日志提取"not found"的节点名，
+     * 从 config 的 account_bindings 里剔除所有引用该节点名的 NodeRef，
+     * 重新生成 config.yaml 并重启 mihomo 一次。
+     * 仅当 lastConfigError 含 "not found" 时触发，避免无限循环。
+     * @param config mihomo 配置 JSON（含 subscriptions + account_bindings）
+     * @return true 表示已尝试恢复（调用方应再次 probeReady）
+     */
+    static boolean attemptAutoRecover(JSONObject config) {
+        String err = lastConfigError;
+        if (err == null || !err.contains("not found") || workDir == null) {
+            return false;
+        }
+        // 提取 fatal 日志里的节点名：格式 "...: '节点名' not found" 或 "...: \"节点名\" not found"
+        String badNode = extractQuotedBefore(err, "not found");
+        if (badNode == null || badNode.isEmpty()) {
+            return false;
+        }
+        LogStore.get().log(TAG, "检测到 mihomo 因节点 [" + badNode + "] not found 致命退出，"
+                + "自动从账号绑定中剔除该节点并重试");
+        // 从 config 的 account_bindings 剔除该节点名
+        JSONArray bindings = config.optJSONArray("account_bindings");
+        if (bindings == null) return false;
+        int removed = 0;
+        for (int i = 0; i < bindings.length(); i++) {
+            JSONObject b = bindings.optJSONObject(i);
+            if (b == null) continue;
+            JSONArray nodes = b.optJSONArray("nodes");
+            if (nodes == null) continue;
+            JSONArray kept = new JSONArray();
+            for (int j = 0; j < nodes.length(); j++) {
+                JSONObject n = nodes.optJSONObject(j);
+                if (n == null) { kept.put(n); continue; }
+                String nn = n.optString("node_name", "");
+                if (!badNode.equals(nn)) {
+                    kept.put(n);
+                } else {
+                    removed++;
+                }
+            }
+            b.put("nodes", kept);
+        }
+        if (removed == 0) {
+            LogStore.get().log(TAG, "未在 account_bindings 找到节点 [" + badNode + "]，放弃恢复");
+            return false;
+        }
+        LogStore.get().log(TAG, "已从 account_bindings 剔除 " + removed + " 个引用 ["
+                + badNode + "] 的节点");
+        // 重新生成 config.yaml 并重启
+        try {
+            List<Subscription> subs = parseSubscriptions(config);
+            File providersDir = new File(workDir, "providers");
+            int socks5Base = config.optInt("socks5_base_port", socks5BasePort);
+            int updateInterval = config.optInt("subscription_update_interval", 3600);
+            List<AccountBinding> okBindings = parseBindings(config, socks5Base, subs);
+            // 只用已存在的 provider 文件（不重新下载，订阅没变）
+            List<Subscription> okSubs = new ArrayList<>();
+            for (Subscription sub : subs) {
+                if (new File(providersDir, sub.providerName + ".yaml").exists()) {
+                    okSubs.add(sub);
+                }
+            }
+            java.util.Map<String, java.util.Set<String>> providerNodeNames =
+                    parseProviderNodeNames(providersDir, okSubs);
+            List<AccountBinding> filteredBindings =
+                    filterBindingsByProviderNodes(okBindings, providerNodeNames);
+            String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, filteredBindings);
+            File configFile = new File(workDir, "config.yaml");
+            try (OutputStream out = new FileOutputStream(configFile)) {
+                out.write(yaml.getBytes(StandardCharsets.UTF_8));
+            }
+            // 清空错误标记，重置进程状态后重启
+            lastConfigError = null;
+            process = null;
+            lastExitCode = -1;
+            // 复用 start 的进程启动逻辑（不重新下载订阅）
+            restartProcessOnly();
+            return true;
+        } catch (Throwable t) {
+            LogStore.get().log(TAG, "自动恢复失败: " + t.getMessage());
+            return false;
+        }
+    }
+
+    /** 从 fatal 日志提取 'not found' 前引号内的节点名。 */
+    private static String extractQuotedBefore(String line, String marker) {
+        int idx = line.indexOf(marker);
+        if (idx <= 0) return null;
+        // 往前找最近的引号对：'...' 或 "..."
+        String before = line.substring(0, idx);
+        int q2 = before.lastIndexOf('\'');
+        int dq2 = before.lastIndexOf('"');
+        int end = Math.max(q2, dq2);
+        if (end <= 0) return null;
+        char qChar = (q2 > dq2) ? '\'' : '"';
+        int start = before.lastIndexOf(qChar, end - 1);
+        if (start < 0 || start >= end) return null;
+        return before.substring(start + 1, end);
+    }
+
+    /** 仅重启 mihomo 子进程（不重新下载订阅/不重算端口），用于自动恢复。 */
+    private static void restartProcessOnly() throws Exception {
+        File configFile = new File(workDir, "config.yaml");
+        String binPath = ensureBinary(android.app.AppGlobals.getInitialApplication());
+        ProcessBuilder pb = new ProcessBuilder(binPath, "-d", workDir.getAbsolutePath(),
+                "-f", configFile.getAbsolutePath());
+        pb.directory(workDir);
+        pb.redirectErrorStream(true);
+        Process p = pb.start();
+        process = p;
+        final Process proc = p;
+        lastExitCode = -1;
+        LogStore.get().log(TAG, "（自动恢复）进程已重启，等待 API 就绪...");
+        Thread reader = new Thread(() -> readOutput(proc), "mihomo-log-reader");
+        reader.setDaemon(true);
+        reader.start();
+        Thread waiter = new Thread(() -> {
+            int code;
+            try { code = proc.waitFor(); }
+            catch (InterruptedException e) { code = -1; }
+            LogStore.get().log(TAG, "进程已退出，exit code = " + code);
+            if (process == proc) {
+                lastExitCode = code;
+                process = null;
+            }
+        }, "mihomo-waiter");
+        waiter.setDaemon(true);
+        waiter.start();
     }
 
     /** 停止 mihomo 子进程。同步等待进程退出（最长 3s），避免快速重启时端口冲突。 */
@@ -505,37 +638,127 @@ public final class MihomoManager {
         return map;
     }
 
-    /** 从 mihomo proxy-provider yaml 文件提取节点名（扫描 proxies: 段下的 - name: 行）。 */
+    /**
+     * 从 mihomo proxy-provider yaml 文件提取节点名。
+     * 支持三种订阅格式（与 isValidSubscriptionContent 一致）：
+     * 1. clash YAML：扫描 proxies: 段下 - name: 行
+     * 2. base64 编码的 share link 列表：先解码
+     * 3. 明文 share link 列表：ss/vmess/trojan/vless/hysteria2/hy2/tuic
+     * 节点名提取规则：share link # 后的 fragment（URL decode）；
+     *                vmess:// 是 base64(JSON)，取 JSON 的 ps 字段；
+     *                无 #/ps 的取协议头+host 作为兜底名（mihomo 自行命名规则）。
+     * 覆盖全部格式后，filterBindingsByProviderNodes 能可靠过滤过期节点名，
+     * 避免机场改名/下架后 binding 引用不存在节点导致 mihomo 整个 config 加载失败。
+     */
     private static java.util.Set<String> parseProxyNamesFromFile(File f) {
         java.util.Set<String> names = new java.util.HashSet<>();
         if (!f.exists()) return names;
+        String body;
         try (BufferedReader br = new BufferedReader(
                 new InputStreamReader(new java.io.FileInputStream(f), StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder();
             String line;
-            boolean inProxies = false;
             while ((line = br.readLine()) != null) {
-                String trimmed = line.trim();
-                if (trimmed.equals("proxies:")) { inProxies = true; continue; }
-                if (inProxies) {
-                    // proxies 段结束：遇到非缩进的非空行且不是列表项
-                    if (!line.isEmpty() && !line.startsWith(" ") && !line.startsWith("-")) {
-                        inProxies = false;
-                        continue;
+                sb.append(line).append('\n');
+            }
+            body = sb.toString();
+        } catch (Throwable ignored) {
+            return names;
+        }
+        names.addAll(parseClashYamlNames(body));
+        if (!names.isEmpty()) return names;  // clash YAML 已解析出节点名，无需再试 share link
+        names.addAll(parseShareLinkNames(body));
+        return names;
+    }
+
+    /** 解析 clash YAML 格式订阅的节点名（扫描 proxies: 段下 - name: 行）。 */
+    private static java.util.Set<String> parseClashYamlNames(String body) {
+        java.util.Set<String> names = new java.util.HashSet<>();
+        boolean inProxies = false;
+        for (String line : body.split("\n", -1)) {
+            String trimmed = line.trim();
+            if (trimmed.equals("proxies:")) { inProxies = true; continue; }
+            if (inProxies) {
+                if (!line.isEmpty() && !line.startsWith(" ") && !line.startsWith("-")) {
+                    inProxies = false;
+                    continue;
+                }
+                if (trimmed.startsWith("- name:")) {
+                    String val = trimmed.substring("- name:".length()).trim();
+                    if (val.length() >= 2
+                            && ((val.startsWith("\"") && val.endsWith("\""))
+                            || (val.startsWith("'") && val.endsWith("'")))) {
+                        val = val.substring(1, val.length() - 1);
                     }
-                    if (trimmed.startsWith("- name:")) {
-                        String val = trimmed.substring("- name:".length()).trim();
-                        // 去引号
-                        if (val.length() >= 2
-                                && ((val.startsWith("\"") && val.endsWith("\""))
-                                || (val.startsWith("'") && val.endsWith("'")))) {
-                            val = val.substring(1, val.length() - 1);
-                        }
-                        if (!val.isEmpty()) names.add(val);
-                    }
+                    if (!val.isEmpty()) names.add(val);
                 }
             }
-        } catch (Throwable ignored) {}
+        }
         return names;
+    }
+
+    /**
+     * 解析 share link 列表格式订阅的节点名（支持 base64 编码与明文）。
+     * 节点名来源优先级：
+     *   1. ss/trojan/vless/hy2/tuic 等：URL # 后的 fragment（URL decode）
+     *   2. vmess://：base64 解码后的 JSON 的 ps 字段
+     *   3. 无 #/ps：返回空（mihomo 会用 host:port 自动命名，但本地难以精确还原，
+     *      为避免误过滤保留空集，让 filterBindingsByProviderNodes 走"非 YAML 保留"分支）
+     */
+    private static java.util.Set<String> parseShareLinkNames(String body) {
+        java.util.Set<String> names = new java.util.HashSet<>();
+        if (body == null || body.isEmpty()) return names;
+        String text = body.trim();
+        // 尝试 base64 解码（标准 + URL-safe 两种）
+        if (!text.contains("://") && !text.contains("proxies:")) {
+            String decoded = null;
+            try {
+                decoded = new String(java.util.Base64.getDecoder().decode(text.replaceAll("\\s+", "")),
+                        StandardCharsets.UTF_8);
+            } catch (Throwable ignored) {
+                try {
+                    decoded = new String(java.util.Base64.getUrlDecoder().decode(text.replaceAll("\\s+", "")),
+                            StandardCharsets.UTF_8);
+                } catch (Throwable ignored2) { /* 非 base64，按明文处理 */ }
+            }
+            if (decoded != null && decoded.contains("://")) text = decoded;
+        }
+        // 逐行解析 share link
+        for (String raw : text.split("\\r?\\n")) {
+            String link = raw.trim();
+            if (link.isEmpty() || !link.contains("://")) continue;
+            String name = extractShareLinkName(link);
+            if (name != null && !name.isEmpty()) names.add(name);
+        }
+        return names;
+    }
+
+    /** 从单个 share link 提取节点名（# fragment 或 vmess ps 字段）。 */
+    private static String extractShareLinkName(String link) {
+        try {
+            if (link.startsWith("vmess://")) {
+                // vmess://base64(JSON)，JSON 含 ps 字段
+                String payload = link.substring("vmess://".length()).trim();
+                byte[] json;
+                try {
+                    json = java.util.Base64.getDecoder().decode(payload);
+                } catch (Throwable ignored) {
+                    json = java.util.Base64.getUrlDecoder().decode(payload);
+                }
+                JSONObject obj = new JSONObject(new String(json, StandardCharsets.UTF_8));
+                return obj.optString("ps", obj.optString("remarks", ""));
+            }
+            // 其他协议：# 后的 fragment 为节点名（URL encoded）
+            int hash = link.indexOf('#');
+            if (hash < 0 || hash == link.length() - 1) return null;
+            String frag = link.substring(hash + 1);
+            // 去掉可能的查询参数（部分协议在 fragment 后还带 ?xxx）
+            int q = frag.indexOf('?');
+            if (q >= 0) frag = frag.substring(0, q);
+            return java.net.URLDecoder.decode(frag, StandardCharsets.UTF_8.name());
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     /**
@@ -1108,6 +1331,10 @@ public final class MihomoManager {
             String line;
             while ((line = br.readLine()) != null) {
                 LogStore.get().raw("[" + TAG + "] " + line);
+                // 检测 fatal 配置错误（节点 not found 等），供 probeReady 失败后自动恢复
+                if (line.contains("level=fatal") && line.contains("Parse config error")) {
+                    lastConfigError = line;
+                }
             }
         } catch (Throwable t) {
             LogStore.get().log(TAG, "日志读取结束: " + t.getMessage());

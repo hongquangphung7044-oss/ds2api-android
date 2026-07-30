@@ -91,6 +91,9 @@ public class ProxyConfigActivity extends Activity {
         LinearLayout container;
         /** 防止 setSelection 同步触发 onItemSelected 导致递归刷新节点列表 */
         boolean suppressNodeRefresh = false;
+        /** 当前选中节点是否失效（订阅已加载但节点名不在实际节点列表中，机场删节点/改名导致）。
+         *  用于徽章显示"失效"而非"超时"，并阻止自动恢复误判。 */
+        boolean invalid = false;
     }
 
     /** fetchNodes 并发保护：onCreate 与 onResume 可能同时触发，避免两个线程并发改缓存导致崩溃 */
@@ -699,10 +702,20 @@ public class ProxyConfigActivity extends Activity {
         }
         row.subSpinner = subSpinner;
 
+        // 延迟徽章（先创建并赋给 row，让 updateNodeSpinnerOptions 能即时显示"失效"标记）
+        TextView delayLabel = new TextView(this);
+        delayLabel.setTextSize(12);
+        delayLabel.setTextColor(Color.parseColor(COLOR_GRAY));
+        delayLabel.setGravity(Gravity.CENTER);
+        delayLabel.setPadding(dp(10), dp(2), dp(10), dp(2));
+        delayLabel.setText("—");
+        delayLabel.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
+        row.delayLabel = delayLabel;
+
         // —— 节点 Spinner ——
         Spinner nodeSpinner = new Spinner(this);
         row.nodeSpinner = nodeSpinner;
-        // 先按 presetSub 填充节点选项，并保留 presetNode
+        // 先按 presetSub 填充节点选项，并保留 presetNode（同时检测失效并更新徽章）
         updateNodeSpinnerOptions(row, presetNode);
 
         // 切换订阅时刷新该行节点选项（保留当前已选节点名）
@@ -721,15 +734,6 @@ public class ProxyConfigActivity extends Activity {
             public void onNothingSelected(android.widget.AdapterView<?> parent) {}
         });
 
-        // 延迟徽章
-        TextView delayLabel = new TextView(this);
-        delayLabel.setTextSize(12);
-        delayLabel.setTextColor(Color.parseColor(COLOR_GRAY));
-        delayLabel.setGravity(Gravity.CENTER);
-        delayLabel.setPadding(dp(10), dp(2), dp(10), dp(2));
-        delayLabel.setText("—");
-        delayLabel.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
-        row.delayLabel = delayLabel;
         nodeRows.add(row);
 
         // 第一行：标签 + 延迟徽章 + 删除按钮
@@ -805,10 +809,17 @@ public class ProxyConfigActivity extends Activity {
         items.add("（未选择）");
         items.addAll(nodes);
         // 保留当前已选节点：若不在节点列表中（订阅失效/未加载完成），追加为自定义项
+        boolean keepNodeIsCustom = false;
         if (keepNode != null && !keepNode.isEmpty()
                 && !"（未选择）".equals(keepNode) && !items.contains(keepNode)) {
             items.add(keepNode);
+            keepNodeIsCustom = true;
         }
+        // 失效检测：订阅已加载（nodes 非空）但选中节点不在实际节点列表中
+        // → 机场删除了该节点或改了名，binding 引用了过期节点名
+        // 订阅未加载（nodes 空）时无法判定，不算失效（保留选择待加载后重判）
+        boolean isInvalid = keepNodeIsCustom && !nodes.isEmpty();
+        row.invalid = isInvalid;
         ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
                 android.R.layout.simple_spinner_item, items);
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
@@ -824,6 +835,19 @@ public class ProxyConfigActivity extends Activity {
         }
         row.nodeSpinner.setSelection(sel);
         row.suppressNodeRefresh = false;
+        // 更新徽章：失效节点显示"失效"（红），有效节点若之前显示"失效"则重置为"—"
+        // 不覆盖已测延迟数值（仅从"失效"恢复到"—"，下次测延迟才填数值）
+        if (row.delayLabel != null) {
+            if (isInvalid) {
+                row.delayLabel.setText("失效");
+                row.delayLabel.setTextColor(Color.parseColor(COLOR_RED));
+                row.delayLabel.setBackground(roundedBackground("#FEE2E2", "#FECACA", dp(10)));
+            } else if ("失效".equals(row.delayLabel.getText().toString())) {
+                row.delayLabel.setText("—");
+                row.delayLabel.setTextColor(Color.parseColor(COLOR_GRAY));
+                row.delayLabel.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
+            }
+        }
     }
 
     /**
@@ -858,9 +882,9 @@ public class ProxyConfigActivity extends Activity {
         }
         final String finalProviderName = providerName;
 
-        // 主线程快照：所有账号卡片里选中该订阅的节点行 {rowIdentity, nodeName, delayLabel}
+        // 主线程快照：所有账号卡片里选中该订阅的节点行 {nodeName, delayLabel, invalid}
         // 避免后台线程访问 Spinner（非线程安全）
-        final List<Object[]> badgeTargets = new ArrayList<>();  // {nodeName, delayLabel}
+        final List<Object[]> badgeTargets = new ArrayList<>();  // {nodeName, delayLabel, invalid}
         for (List<NodeRow> rows : accountNodeRows) {
             for (NodeRow r : rows) {
                 if (r.subSpinner.getSelectedItemPosition() > 0
@@ -869,11 +893,17 @@ public class ProxyConfigActivity extends Activity {
                     if (r.nodeSpinner.getSelectedItem() != null) {
                         nodeName = r.nodeSpinner.getSelectedItem().toString();
                     }
-                    badgeTargets.add(new Object[]{nodeName, r.delayLabel});
-                    // 重置徽章
-                    r.delayLabel.setText("···");
-                    r.delayLabel.setTextColor(Color.parseColor(COLOR_GRAY));
-                    r.delayLabel.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
+                    badgeTargets.add(new Object[]{nodeName, r.delayLabel, r.invalid});
+                    // 重置徽章：失效节点保持"失效"标记，有效节点显示测试中
+                    if (r.invalid) {
+                        r.delayLabel.setText("失效");
+                        r.delayLabel.setTextColor(Color.parseColor(COLOR_RED));
+                        r.delayLabel.setBackground(roundedBackground("#FEE2E2", "#FECACA", dp(10)));
+                    } else {
+                        r.delayLabel.setText("···");
+                        r.delayLabel.setTextColor(Color.parseColor(COLOR_GRAY));
+                        r.delayLabel.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
+                    }
                 }
             }
         }
@@ -895,8 +925,13 @@ public class ProxyConfigActivity extends Activity {
             for (Object[] target : badgeTargets) {
                 String nodeName = (String) target[0];
                 final TextView lbl = (TextView) target[1];
+                boolean invalid = (Boolean) target[2];
                 if (nodeName.isEmpty() || "（未选择）".equals(nodeName)) {
                     runOnUiThread(() -> lbl.setText("—"));
+                    continue;
+                }
+                // 失效节点（机场删节点/改名）保持"失效"标记，不显示"超时"误导用户
+                if (invalid) {
                     continue;
                 }
                 Integer delay = delayMap.get(nodeName);
@@ -1047,6 +1082,15 @@ public class ProxyConfigActivity extends Activity {
                 // 导致端口错位或 secret 不匹配(API 401)。与 doSave/ServerService 保持一致。
                 writeMihomoConfig();
                 boolean ready = MihomoManager.probeReady();
+                // 启动失败时尝试自动恢复（节点名 not found 等 fatal 错误）：
+                // 剔除报错节点后重试启动一次，避免因单个节点名不匹配导致整个 mihomo 无法启动
+                if (!ready) {
+                    boolean recovered = MihomoManager.attemptAutoRecover(mihomoConfig);
+                    if (recovered) {
+                        ready = MihomoManager.probeReady();
+                        if (ready) writeMihomoConfig();  // 恢复改了 bindings，落盘
+                    }
+                }
                 if (ready) {
                     MihomoManager.applyNodeSelection(mihomoConfig);
                     // 修复 C4 一致性：独立启动 mihomo 后也同步 config.json 代理条目，
@@ -1174,6 +1218,17 @@ public class ProxyConfigActivity extends Activity {
                         // 修复 C2：原版 start() 生成的 secret/调整的端口只进内存不持久化。
                         writeMihomoConfig();
                         boolean ready = MihomoManager.probeReady();
+                        // 启动失败时尝试自动恢复（节点名 not found 等 fatal 错误）：
+                        // 剔除报错节点后重试启动一次，与 doStartMihomo 保持一致
+                        if (!ready) {
+                            boolean recovered = MihomoManager.attemptAutoRecover(mihomoConfig);
+                            if (recovered) {
+                                ready = MihomoManager.probeReady();
+                                if (ready) {
+                                    writeMihomoConfig();  // 恢复改了 bindings，落盘
+                                }
+                            }
+                        }
                         if (ready) {
                             MihomoManager.applyNodeSelection(mihomoConfig);
                             // 修复 C4：重启后 mihomo 的 SOCKS5 端口可能已变（端口避让），
