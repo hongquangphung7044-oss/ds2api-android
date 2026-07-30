@@ -255,16 +255,22 @@ public final class MihomoManager {
         return false;
     }
 
-    /** 停止 mihomo 子进程。 */
+    /** 停止 mihomo 子进程。同步等待进程退出（最长 3s），避免快速重启时端口冲突。 */
     static synchronized void stop() {
         Process p = process;
         if (p != null) {
             LogStore.get().log(TAG, "正在停止 mihomo...");
             p.destroy();
-            new Thread(() -> {
-                try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+            // 同步等待进程退出，最长 3 秒；超时后强制 kill
+            // 修复 C3：原异步 destroyForcibly 导致 doSave 快速重启时端口仍被占用
+            boolean exited = false;
+            try {
+                exited = p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {}
+            if (!exited) {
                 try { p.destroyForcibly(); } catch (Throwable ignored) {}
-            }, "mihomo-killer").start();
+                LogStore.get().log(TAG, "mihomo 3 秒内未退出，已强制终止");
+            }
             process = null;
         }
         // 手动停止：重置为"未运行"，避免 UI 显示"已退出"
@@ -301,9 +307,12 @@ public final class MihomoManager {
     }
 
     /**
-     * App 层重新下载所有订阅文件到 providers/ 目录，并触发内核热重载。
-     * 用于"更新订阅"按钮：file provider 只能通过替换文件 + reload 刷新。
-     * @param config mihomo 配置 JSON（含 subscriptions）
+     * App 层重新下载所有订阅文件到 providers/ 目录，重新生成 config.yaml 并热重载。
+     * 用于"更新订阅"按钮：file provider 只能通过替换文件 + 重生成 config + reload 刷新。
+     * 修复 C1：原版只 reload 不重生成 config.yaml，导致 fallback group 的 proxies 列表
+     *         引用过期节点名（机场改名/下架后），mihomo reload 失败或静默丢节点。
+     * 修复 C5：重生成时用实际拉取的节点列表过滤掉失效节点名，避免引用不存在的节点。
+     * @param config mihomo 配置 JSON（含 subscriptions + account_bindings）
      * @return 成功下载的订阅数
      */
     static int redownloadAllSubscriptions(JSONObject config) {
@@ -311,18 +320,40 @@ public final class MihomoManager {
         List<Subscription> subs = parseSubscriptions(config);
         File providersDir = new File(workDir, "providers");
         providersDir.mkdirs();
-        int ok = 0;
+        // 重新下载所有订阅文件
+        List<Subscription> okSubs = new ArrayList<>();
         for (Subscription sub : subs) {
             File subFile = new File(providersDir, sub.providerName + ".yaml");
             if (downloadSubscription(sub.url, subFile, sub.name)) {
-                ok++;
+                okSubs.add(sub);
             }
         }
-        LogStore.get().log(TAG, "重新下载订阅: " + ok + "/" + subs.size() + " 成功");
-        if (ok > 0) {
-            reloadConfig();
+        LogStore.get().log(TAG, "重新下载订阅: " + okSubs.size() + "/" + subs.size() + " 成功");
+        if (okSubs.isEmpty()) {
+            LogStore.get().log(TAG, "更新订阅失败：所有订阅下载失败，保持旧配置不变");
+            return 0;
         }
-        return ok;
+        // 重新生成 config.yaml（用实际拉取的节点列表过滤失效节点名，C5）
+        try {
+            int socks5Base = config.optInt("socks5_base_port", socks5BasePort);
+            int updateInterval = config.optInt("subscription_update_interval", 3600);
+            List<AccountBinding> bindings = parseBindings(config, socks5Base, subs);
+            String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, bindings);
+            File configFile = new File(workDir, "config.yaml");
+            try (OutputStream out = new FileOutputStream(configFile)) {
+                out.write(yaml.getBytes(StandardCharsets.UTF_8));
+            }
+            LogStore.get().log(TAG, "更新订阅后已重新生成 config.yaml");
+        } catch (Throwable t) {
+            LogStore.get().log(TAG, "重新生成 config.yaml 失败: " + t.getMessage());
+            return okSubs.size();
+        }
+        // 热重载
+        boolean reloaded = reloadConfig();
+        if (!reloaded) {
+            LogStore.get().log(TAG, "警告: 热重载失败，mihomo 仍跑旧配置");
+        }
+        return okSubs.size();
     }
 
     /** 获取所有已配置订阅的 provider 名列表。 */
@@ -627,7 +658,8 @@ public final class MihomoManager {
                 "ClashMetaForAndroid/2.10.4",
                 "clash.meta",
                 "mihomo/v1.19.0",
-                "ClashforWindows/0.20.39",
+                "FlClash/0.8.7",
+                "clash-nyanpasu/v2.0.0",
                 "clash-verge/v1.7.7",
                 "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -685,23 +717,33 @@ public final class MihomoManager {
                 || body.contains("\"proxies\"")) {
             return true;
         }
-        // 3. 明文 share link
+        // 3. 明文 share link（含 hy2:// 短协议头，H1 修复）
         if (body.contains("ss://") || body.contains("vmess://") || body.contains("trojan://")
-                || body.contains("vless://") || body.contains("hysteria") || body.contains("tuic://")) {
+                || body.contains("vless://") || body.contains("hysteria") || body.contains("hy2://")
+                || body.contains("tuic://")) {
             return true;
         }
         // 2. base64 编码：尝试解码看是否含 share link
+        // H2 修复：先试标准 decoder，失败再试 URL-safe decoder（部分机场用 -/_ 替代 +//）
+        String trimmed = body.trim().replaceAll("\\s+", "");
+        String decodedStr = null;
         try {
-            String trimmed = body.trim().replaceAll("\\s+", "");
             byte[] decoded = java.util.Base64.getDecoder().decode(trimmed);
-            String decodedStr = new String(decoded, StandardCharsets.UTF_8);
-            return decodedStr.contains("ss://") || decodedStr.contains("vmess://")
-                    || decodedStr.contains("trojan://") || decodedStr.contains("vless://")
-                    || decodedStr.contains("hysteria") || decodedStr.contains("tuic://");
+            decodedStr = new String(decoded, StandardCharsets.UTF_8);
         } catch (Throwable ignored) {
-            // 非 base64，也不是已知格式
-            return false;
+            // 标准 decoder 失败，尝试 URL-safe decoder（容忍 -/_ 和无 padding）
+            try {
+                byte[] decoded = java.util.Base64.getUrlDecoder().decode(trimmed);
+                decodedStr = new String(decoded, StandardCharsets.UTF_8);
+            } catch (Throwable ignored2) {
+                // 两种 decoder 都失败，非 base64
+                return false;
+            }
         }
+        return decodedStr.contains("ss://") || decodedStr.contains("vmess://")
+                || decodedStr.contains("trojan://") || decodedStr.contains("vless://")
+                || decodedStr.contains("hysteria") || decodedStr.contains("hy2://")
+                || decodedStr.contains("tuic://");
     }
 
     /** HTTP GET 下载，跟随重定向，返回字节数组。 */
@@ -758,6 +800,149 @@ public final class MihomoManager {
             return result;
         } catch (Throwable t) {
             throw new RuntimeException(t);
+        }
+    }
+
+    /**
+     * 把 mihomo 的账号 SOCKS5 端口作为 Proxy 条目注入 ds2api 的 config.json，
+     * 并设置各账号的 proxy_id。原子写入，避免与 UI 保存并发时写坏文件。
+     *
+     * 用于：
+     * - ServerService 启动 mihomo 后注入代理（首次启动）
+     * - ProxyConfigActivity.doSave 重启 mihomo 后重新同步 config.json
+     *   修复 C4：mihomo 重启可能因端口冲突递增调整 SOCKS5 端口，旧 config.json
+     *   里的代理端口会失效，必须重新注入。否则 ds2api 仍指向旧端口 → ECONNREFUSED。
+     *
+     * @param configFile ds2api config.json
+     * @param mihomoConfig mihomo 配置 JSON（含 account_bindings + socks5_base_port）
+     * @return 注入的代理条目数；0 表示无绑定或写入失败
+     */
+    static int injectProxiesIntoConfig(File configFile, JSONObject mihomoConfig) {
+        try {
+            if (!configFile.exists()) return 0;
+            int socks5Base = mihomoConfig.optInt("socks5_base_port", socks5BasePort);
+            JSONArray bindings = mihomoConfig.optJSONArray("account_bindings");
+            if (bindings == null || bindings.length() == 0) {
+                LogStore.get().log(TAG, "无账号节点绑定，跳过 Proxy 注入");
+                // 仍清理旧条目，避免残留死代理指向已不监听的端口
+                clearProxiesFromConfig(configFile);
+                return 0;
+            }
+            byte[] data = readAll(new java.io.FileInputStream(configFile));
+            JSONObject cfg = new JSONObject(new String(data, StandardCharsets.UTF_8));
+
+            // 移除旧的 mihomo-* 代理（避免重复注入堆积）
+            JSONArray proxies = cfg.optJSONArray("proxies");
+            if (proxies == null) proxies = new JSONArray();
+            JSONArray cleaned = new JSONArray();
+            for (int i = 0; i < proxies.length(); i++) {
+                JSONObject p = proxies.optJSONObject(i);
+                if (p != null && !p.optString("id", "").startsWith("mihomo-")) {
+                    cleaned.put(p);
+                }
+            }
+            proxies = cleaned;
+
+            // 为每个绑定生成 Proxy 条目
+            JSONObject accountProxyMap = new JSONObject();
+            for (int i = 0; i < bindings.length(); i++) {
+                JSONObject b = bindings.optJSONObject(i);
+                if (b == null) continue;
+                String identifier = b.optString("account_identifier", "").trim();
+                if (identifier.isEmpty()) continue;
+                String proxyId = "mihomo-" + i;
+                int port = socks5Base + i;
+                JSONObject proxy = new JSONObject();
+                proxy.put("id", proxyId);
+                proxy.put("name", "mihomo-" + identifier);
+                proxy.put("type", "socks5");
+                proxy.put("host", "127.0.0.1");
+                proxy.put("port", port);
+                proxies.put(proxy);
+                accountProxyMap.put(identifier, proxyId);
+                LogStore.get().log(TAG, "注入 Proxy: " + proxyId + " → 127.0.0.1:" + port
+                        + " (账号: " + identifier + ")");
+            }
+            cfg.put("proxies", proxies);
+
+            // 设置 accounts 的 proxy_id
+            JSONArray accounts = cfg.optJSONArray("accounts");
+            if (accounts != null) {
+                for (int i = 0; i < accounts.length(); i++) {
+                    JSONObject acc = accounts.optJSONObject(i);
+                    if (acc == null) continue;
+                    String email = acc.optString("email", "").trim();
+                    String mobile = acc.optString("mobile", "").trim();
+                    String name = acc.optString("name", "").trim();
+                    String identifier = !email.isEmpty() ? email
+                            : (!mobile.isEmpty() ? mobile : name);
+                    if (accountProxyMap.has(identifier)) {
+                        acc.put("proxy_id", accountProxyMap.getString(identifier));
+                    }
+                }
+            }
+            atomicWrite(configFile, cfg.toString(2).getBytes(StandardCharsets.UTF_8));
+            LogStore.get().log(TAG, "Proxy 注入完成，已写回 config.json");
+            return bindings.length();
+        } catch (Throwable t) {
+            LogStore.get().log(TAG, "Proxy 注入失败: " + t.getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * 从 config.json 移除所有 mihomo-* 代理条目，并清空 accounts 里对应的 proxy_id。
+     * 用于 mihomo 启动失败/未就绪时降级（修复 M3/C6）：
+     * 避免 ds2api 指向已死的 SOCKS5 端口导致全部请求 ECONNREFUSED。
+     */
+    static void clearProxiesFromConfig(File configFile) {
+        try {
+            if (!configFile.exists()) return;
+            byte[] data = readAll(new java.io.FileInputStream(configFile));
+            JSONObject cfg = new JSONObject(new String(data, StandardCharsets.UTF_8));
+
+            JSONArray proxies = cfg.optJSONArray("proxies");
+            if (proxies != null) {
+                JSONArray cleaned = new JSONArray();
+                for (int i = 0; i < proxies.length(); i++) {
+                    JSONObject p = proxies.optJSONObject(i);
+                    if (p != null && !p.optString("id", "").startsWith("mihomo-")) {
+                        cleaned.put(p);
+                    }
+                }
+                cfg.put("proxies", cleaned);
+            }
+            JSONArray accounts = cfg.optJSONArray("accounts");
+            if (accounts != null) {
+                for (int i = 0; i < accounts.length(); i++) {
+                    JSONObject acc = accounts.optJSONObject(i);
+                    if (acc == null) continue;
+                    String pid = acc.optString("proxy_id", "");
+                    if (pid.startsWith("mihomo-")) {
+                        acc.remove("proxy_id");
+                    }
+                }
+            }
+            atomicWrite(configFile, cfg.toString(2).getBytes(StandardCharsets.UTF_8));
+            LogStore.get().log(TAG, "已清理 config.json 中的 mihomo 代理条目");
+        } catch (Throwable t) {
+            LogStore.get().log(TAG, "清理 mihomo 代理条目失败: " + t.getMessage());
+        }
+    }
+
+    /** 原子写入：临时文件 + fsync + rename，避免并发写或进程被杀导致配置损坏。 */
+    private static void atomicWrite(File target, byte[] data) throws Exception {
+        File tmp = new File(target.getAbsolutePath() + ".tmp");
+        try (FileOutputStream out = new FileOutputStream(tmp)) {
+            out.write(data);
+            out.flush();
+            try { out.getFD().sync(); } catch (Throwable ignored) {}
+        }
+        if (!tmp.renameTo(target)) {
+            //noinspection ResultOfMethodCallIgnored
+            target.delete();
+            //noinspection ResultOfMethodCallIgnored
+            tmp.renameTo(target);
         }
     }
 
@@ -855,12 +1040,24 @@ public final class MihomoManager {
                 c.setRequestProperty("Authorization", "Bearer " + apiSecret);
             }
             int code = c.getResponseCode();
-            if (code != 200) return null;
+            if (code != 200) {
+                // 非 200 记日志便于排障（401=secret 错，404=provider/group 不存在）
+                if (code == 401 || code == 403) {
+                    LogStore.get().log(TAG, "apiGet " + path + " 鉴权失败(" + code
+                            + ")，可能 secret 不一致");
+                }
+                return null;
+            }
             try (InputStream in = c.getInputStream()) {
                 byte[] data = readAll(in);
                 return new JSONObject(new String(data, StandardCharsets.UTF_8));
             }
         } catch (Throwable t) {
+            // H3 修复：网络异常打日志，避免静默失败导致排障困难
+            // 只对非 ConnectException（连接拒绝，mihomo 未运行时的正常情况）打日志
+            if (!(t instanceof java.net.ConnectException)) {
+                LogStore.get().log(TAG, "apiGet " + path + " 异常: " + t.getMessage());
+            }
             return null;
         } finally {
             if (c != null) c.disconnect();

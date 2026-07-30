@@ -399,98 +399,47 @@ public class ServerService extends Service {
 
         LogStore.get().log("APP", "========== 启动 mihomo 代理桥 ==========");
         File mihomoWorkDir = new File(getFilesDir(), "mihomo");
-        MihomoManager.start(this, mihomoWorkDir, mihomo);
-
-        // 等待 mihomo API 就绪
-        if (!MihomoManager.probeReady()) {
-            LogStore.get().log("APP", "警告: mihomo API 未就绪，代理可能不可用");
-        } else {
-            // 把每个账号的 selector 切换到用户选定的主节点
-            // applyNodeSelection 内部会等待 provider 节点加载完成，无需额外 sleep
-            MihomoManager.applyNodeSelection(mihomo);
-        }
-
-        // 注入 Proxy 条目到 config.json
-        byte[] data = readAll(new java.io.FileInputStream(configFile));
-        JSONObject cfg = new JSONObject(new String(data, StandardCharsets.UTF_8));
-        injectProxies(cfg, configFile, mihomo);
-    }
-
-    /**
-     * 为每个 mihomo 账号绑定生成 ds2api Proxy 条目，设置 accounts 的 proxy_id，
-     * 写回 config.json。同时移除旧的 mihomo-* 代理条目避免堆积。
-     */
-    private void injectProxies(JSONObject cfg, File configFile, JSONObject mihomo) throws Exception {
-        int socks5Base = mihomo.optInt("socks5_base_port", MihomoManager.DEFAULT_SOCKS5_BASE_PORT);
-        JSONArray bindings = mihomo.optJSONArray("account_bindings");
-        if (bindings == null || bindings.length() == 0) {
-            LogStore.get().log("APP", "无账号节点绑定，跳过 Proxy 注入");
+        // 修复 C6：mihomo 启动失败（订阅全失败、二进制不可执行、配置错误等）不再
+        // 抛异常中断整个 ds2api 启动。降级为清理死代理条目后继续启动 ds2api，
+        // 用户仍可直连使用（无代理），避免"代理坏了 = 服务完全起不来"。
+        try {
+            MihomoManager.start(this, mihomoWorkDir, mihomo);
+        } catch (Throwable t) {
+            LogStore.get().log("APP", "mihomo 启动失败，降级直连模式继续启动 ds2api: " + t.getMessage());
+            MihomoManager.clearProxiesFromConfig(configFile);
             return;
         }
-
-        // 读取现有 proxies 数组（可能不存在）
-        JSONArray proxies = cfg.optJSONArray("proxies");
-        if (proxies == null) proxies = new JSONArray();
-
-        // 移除旧的 mihomo-* 代理（避免重复注入时堆积）
-        JSONArray cleaned = new JSONArray();
-        for (int i = 0; i < proxies.length(); i++) {
-            JSONObject p = proxies.optJSONObject(i);
-            if (p != null) {
-                String id = p.optString("id", "");
-                if (!id.startsWith("mihomo-")) {
-                    cleaned.put(p);
-                }
-            }
-        }
-        proxies = cleaned;
-
-        // 为每个绑定生成 Proxy 条目
-        JSONObject accountProxyMap = new JSONObject();
-        for (int i = 0; i < bindings.length(); i++) {
-            JSONObject b = bindings.optJSONObject(i);
-            if (b == null) continue;
-            String identifier = b.optString("account_identifier", "").trim();
-            if (identifier.isEmpty()) continue;
-            String proxyId = "mihomo-" + i;
-            int port = socks5Base + i;
-
-            JSONObject proxy = new JSONObject();
-            proxy.put("id", proxyId);
-            proxy.put("name", "mihomo-" + identifier);
-            proxy.put("type", "socks5");
-            proxy.put("host", "127.0.0.1");
-            proxy.put("port", port);
-            proxies.put(proxy);
-            accountProxyMap.put(identifier, proxyId);
-            LogStore.get().log("APP", "注入 Proxy: " + proxyId + " → 127.0.0.1:" + port
-                    + " (账号: " + identifier + ")");
-        }
-        cfg.put("proxies", proxies);
-
-        // 设置 accounts 的 proxy_id
-        JSONArray accounts = cfg.optJSONArray("accounts");
-        if (accounts != null) {
-            for (int i = 0; i < accounts.length(); i++) {
-                JSONObject acc = accounts.optJSONObject(i);
-                if (acc == null) continue;
-                String email = acc.optString("email", "").trim();
-                String mobile = acc.optString("mobile", "").trim();
-                String name = acc.optString("name", "").trim();
-                String identifier = !email.isEmpty() ? email : (!mobile.isEmpty() ? mobile : name);
-                if (accountProxyMap.has(identifier)) {
-                    acc.put("proxy_id", accountProxyMap.getString(identifier));
-                }
-            }
+        // 修复 C2：start() 可能新生成 api_secret 或因端口冲突递增 socks5_base_port/api_port，
+        // 这些变更只写进了内存 mihomo 对象。必须落盘 mihomo_config.json，否则下次启动
+        // 读到旧值，导致 secret 不匹配（API 401）或端口错位。
+        try {
+            atomicWrite(mihomoFile, mihomo.toString(2).getBytes(StandardCharsets.UTF_8));
+        } catch (Throwable t) {
+            LogStore.get().log("APP", "持久化 mihomo_config.json 失败（不影响本次运行）: " + t.getMessage());
         }
 
-        // 写回 config.json（原子写：临时文件 + rename，避免与 UI 保存并发时写坏文件）
-        atomicWrite(configFile, cfg.toString(2).getBytes(StandardCharsets.UTF_8));
-        LogStore.get().log("APP", "Proxy 注入完成，已写回 config.json");
+        // 等待 mihomo API 就绪
+        // 修复 M3：原版 probeReady 失败仍调 injectProxies，会把指向未监听端口的
+        // 死代理写进 config.json，导致 ds2api 所有请求 ECONNREFUSED。改为：未就绪
+        // 时清理死代理条目并跳过注入，让 ds2api 直连运行。
+        if (!MihomoManager.probeReady()) {
+            LogStore.get().log("APP", "警告: mihomo API 未就绪，清理死代理条目，ds2api 直连运行");
+            MihomoManager.clearProxiesFromConfig(configFile);
+            return;
+        }
+        // 把每个账号的 selector 切换到用户选定的主节点
+        // applyNodeSelection 内部会等待 provider 节点加载完成，无需额外 sleep
+        MihomoManager.applyNodeSelection(mihomo);
+
+        // 注入 Proxy 条目到 config.json（用当前实际 SOCKS5 端口，端口冲突递增后也能同步）
+        MihomoManager.injectProxiesIntoConfig(configFile, mihomo);
+
         // 验证第一个账号的代理出口 IP（确认链路可用）。
         // 延迟 + 重试：mihomo 刚启动时节点可能还没就绪，立即验证会误报失败。
-        if (bindings.length() > 0) {
-            final int firstPort = socks5Base;
+        JSONArray bindings = mihomo.optJSONArray("account_bindings");
+        if (bindings != null && bindings.length() > 0) {
+            final int firstPort = mihomo.optInt("socks5_base_port",
+                    MihomoManager.DEFAULT_SOCKS5_BASE_PORT);
             new Thread(() -> {
                 try { Thread.sleep(5000); } catch (InterruptedException ignored) { return; }
                 String exit = null;

@@ -1128,10 +1128,23 @@ public class ProxyConfigActivity extends Activity {
                         Thread.sleep(800); // 等待端口释放
                         File workDir = new File(getFilesDir(), "mihomo");
                         MihomoManager.start(this, workDir, mihomoConfig);
+                        // start() 可能因端口冲突递增 socks5_base_port/api_port，或新生成
+                        // api_secret，并写回 mihomoConfig 对象。必须落盘，否则下次启动读到旧值。
+                        // 修复 C2：原版 start() 生成的 secret/调整的端口只进内存不持久化。
+                        writeMihomoConfig();
                         boolean ready = MihomoManager.probeReady();
                         if (ready) {
                             MihomoManager.applyNodeSelection(mihomoConfig);
+                            // 修复 C4：重启后 mihomo 的 SOCKS5 端口可能已变（端口避让），
+                            // 必须重新注入 Proxy 到 config.json，否则 ds2api 仍指向旧端口。
+                            // 即使 ds2api 当前未运行，下次启动 ServerService 会读到正确的代理端口。
+                            File cfgFile = new File(getFilesDir(), "config.json");
+                            MihomoManager.injectProxiesIntoConfig(cfgFile, mihomoConfig);
                             fetchNodes();
+                        } else {
+                            // 未就绪：清理死代理，避免 config.json 残留指向未监听端口的条目
+                            File cfgFile = new File(getFilesDir(), "config.json");
+                            MihomoManager.clearProxiesFromConfig(cfgFile);
                         }
                         final boolean finalReady = ready;
                         runOnUiThread(() -> {
