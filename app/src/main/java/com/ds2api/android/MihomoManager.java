@@ -169,8 +169,14 @@ public final class MihomoManager {
         }
 
         // 4. 只用下载成功的订阅生成 config.yaml（避免引用不存在的 provider 文件）
+        //    同时用 provider 实际节点名过滤 bindings，避免机场改名/下架后引用不存在
+        //    的节点名导致 mihomo 整个 config 加载失败（所有账号代理失效）
+        java.util.Map<String, java.util.Set<String>> providerNodeNames =
+                parseProviderNodeNames(providersDir, okSubs);
+        List<AccountBinding> filteredBindings =
+                filterBindingsByProviderNodes(okBindings, providerNodeNames);
         File configFile = new File(workDir, "config.yaml");
-        String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, okBindings);
+        String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, filteredBindings);
         try (OutputStream out = new FileOutputStream(configFile)) {
             out.write(yaml.getBytes(StandardCharsets.UTF_8));
         }
@@ -338,7 +344,12 @@ public final class MihomoManager {
             int socks5Base = config.optInt("socks5_base_port", socks5BasePort);
             int updateInterval = config.optInt("subscription_update_interval", 3600);
             List<AccountBinding> bindings = parseBindings(config, socks5Base, subs);
-            String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, bindings);
+            // 用 provider 实际节点名过滤 bindings（机场改名/下架后旧节点名过期）
+            java.util.Map<String, java.util.Set<String>> providerNodeNames =
+                    parseProviderNodeNames(providersDir, okSubs);
+            List<AccountBinding> filteredBindings =
+                    filterBindingsByProviderNodes(bindings, providerNodeNames);
+            String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, filteredBindings);
             File configFile = new File(workDir, "config.yaml");
             try (OutputStream out = new FileOutputStream(configFile)) {
                 out.write(yaml.getBytes(StandardCharsets.UTF_8));
@@ -477,6 +488,81 @@ public final class MihomoManager {
     }
 
     // ========== 配置生成 ==========
+
+    /**
+     * 解析已下载的 provider yaml 文件，提取每个订阅的实际节点名集合。
+     * 用于过滤 account_bindings 中因机场改名/下架而过期的节点名，避免
+     * generateConfigYaml 写入不存在的节点名导致 mihomo 整个 config 加载失败。
+     * 非 YAML 格式（base64 share link）的 provider 文件返回空集合（不过滤）。
+     */
+    private static java.util.Map<String, java.util.Set<String>> parseProviderNodeNames(
+            File providersDir, List<Subscription> subs) {
+        java.util.Map<String, java.util.Set<String>> map = new java.util.HashMap<>();
+        for (Subscription sub : subs) {
+            File f = new File(providersDir, sub.providerName + ".yaml");
+            map.put(sub.name, parseProxyNamesFromFile(f));
+        }
+        return map;
+    }
+
+    /** 从 mihomo proxy-provider yaml 文件提取节点名（扫描 proxies: 段下的 - name: 行）。 */
+    private static java.util.Set<String> parseProxyNamesFromFile(File f) {
+        java.util.Set<String> names = new java.util.HashSet<>();
+        if (!f.exists()) return names;
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(new java.io.FileInputStream(f), StandardCharsets.UTF_8))) {
+            String line;
+            boolean inProxies = false;
+            while ((line = br.readLine()) != null) {
+                String trimmed = line.trim();
+                if (trimmed.equals("proxies:")) { inProxies = true; continue; }
+                if (inProxies) {
+                    // proxies 段结束：遇到非缩进的非空行且不是列表项
+                    if (!line.isEmpty() && !line.startsWith(" ") && !line.startsWith("-")) {
+                        inProxies = false;
+                        continue;
+                    }
+                    if (trimmed.startsWith("- name:")) {
+                        String val = trimmed.substring("- name:".length()).trim();
+                        // 去引号
+                        if (val.length() >= 2
+                                && ((val.startsWith("\"") && val.endsWith("\""))
+                                || (val.startsWith("'") && val.endsWith("'")))) {
+                            val = val.substring(1, val.length() - 1);
+                        }
+                        if (!val.isEmpty()) names.add(val);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return names;
+    }
+
+    /**
+     * 用 provider 实际节点名过滤 account_bindings 里的节点引用。
+     * 节点名不在 provider 实际列表中的被剔除；provider 文件非 YAML（空集合）则保留（让 mihomo 处理）。
+     */
+    private static List<AccountBinding> filterBindingsByProviderNodes(
+            List<AccountBinding> bindings,
+            java.util.Map<String, java.util.Set<String>> providerNodeNames) {
+        List<AccountBinding> filtered = new ArrayList<>();
+        for (AccountBinding b : bindings) {
+            List<NodeRef> validNodes = new ArrayList<>();
+            for (NodeRef ref : b.nodes) {
+                java.util.Set<String> names = providerNodeNames.get(ref.subscriptionName);
+                if (names == null || names.isEmpty()) {
+                    // provider 文件非 YAML 或解析失败，保留节点（让 mihomo 自己处理）
+                    validNodes.add(ref);
+                } else if (names.contains(ref.nodeName)) {
+                    validNodes.add(ref);
+                }
+                // 节点名不在 provider 实际列表 → 过滤掉（机场改名/下架）
+            }
+            filtered.add(new AccountBinding(b.accountIdentifier, validNodes,
+                    b.currentNodeIndex, b.socksPort, b.index));
+        }
+        return filtered;
+    }
 
     /**
      * 生成 mihomo config.yaml。

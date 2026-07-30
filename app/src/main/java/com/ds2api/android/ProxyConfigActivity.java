@@ -1050,7 +1050,13 @@ public class ProxyConfigActivity extends Activity {
                     startMihomoBtn.setEnabled(true);
                     startMihomoBtn.setText("启动 mihomo");
                     refreshMihomoStatus();
-                    if (!ready) {
+                    if (ready) {
+                        // ds2api 进程启动时一次性读 config.json，无热重载。
+                        // injectProxiesIntoConfig 改了 config.json，运行中的 ds2api 需重启才生效。
+                        if (ServerService.isRunning()) {
+                            toast("mihomo 已启动。请重启 ds2api 服务使代理生效");
+                        }
+                    } else {
                         toast("mihomo 启动失败，请查看主界面日志");
                     }
                 });
@@ -1174,7 +1180,18 @@ public class ProxyConfigActivity extends Activity {
                         final boolean finalReady = ready;
                         runOnUiThread(() -> {
                             refreshMihomoStatus();
-                            toast(finalReady ? "已保存并重启 mihomo" : "重启失败，请查看日志");
+                            if (finalReady) {
+                                // ds2api 进程启动时一次性读 config.json，无热重载。
+                                // injectProxiesIntoConfig 改了 config.json 的代理条目，
+                                // 但运行中的 ds2api 内存里仍是旧 proxy_id/端口，需重启才生效。
+                                if (ServerService.isRunning()) {
+                                    toast("已保存并重启 mihomo。请重启 ds2api 服务使新代理生效");
+                                } else {
+                                    toast("已保存并重启 mihomo");
+                                }
+                            } else {
+                                toast("重启失败，请查看日志");
+                            }
                         });
                     } catch (Throwable t2) {
                         runOnUiThread(() -> toast("重启失败: " + t2.getMessage()));
