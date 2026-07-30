@@ -1189,6 +1189,11 @@ public final class MihomoManager {
                             : (!mobile.isEmpty() ? mobile : name);
                     if (accountProxyMap.has(identifier)) {
                         acc.put("proxy_id", accountProxyMap.getString(identifier));
+                    } else {
+                        // 该账号无 binding（未配代理或账号已删除），清除旧 proxy_id，
+                        // 否则残留的 mihomo-N 指向不存在的 proxy 会导致 ds2api 启动失败
+                        // （"account proxy_id references unknown proxy"）
+                        acc.remove("proxy_id");
                     }
                 }
             }
