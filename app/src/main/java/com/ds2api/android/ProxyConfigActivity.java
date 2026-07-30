@@ -1065,17 +1065,26 @@ public class ProxyConfigActivity extends Activity {
     }
 
     private void doStopMihomo() {
-        MihomoManager.stop();
-        // 停止后 SOCKS5 端口不再监听，必须清理 config.json 的 mihomo-* 代理条目，
-        // 否则 ds2api 仍指向死端口导致全部请求 ECONNREFUSED。
+        // stop() 内部 synchronized + waitFor(3s) 同步等进程退出，在主线程调用会阻塞 UI
+        // 触发 ANR。改为子线程执行 stop + 清理，UI 先禁用按钮显示"停止中"。
+        stopMihomoBtn.setEnabled(false);
+        stopMihomoBtn.setText("停止中...");
         new Thread(() -> {
+            MihomoManager.stop();
+            // 停止后 SOCKS5 端口不再监听，必须清理 config.json 的 mihomo-* 代理条目，
+            // 否则 ds2api 仍指向死端口导致全部请求 ECONNREFUSED。
             try {
                 MihomoManager.clearProxiesFromConfig(new File(getFilesDir(), "config.json"));
             } catch (Throwable ignored) {}
-        }, "proxy-cleanup").start();
-        refreshMihomoStatus();
-        subNodeCache.clear();
-        toast("mihomo 已停止");
+            runOnUiThread(() -> {
+                if (isFinishing()) return;
+                refreshMihomoStatus();
+                subNodeCache.clear();
+                stopMihomoBtn.setEnabled(true);
+                stopMihomoBtn.setText("停止");
+                toast("mihomo 已停止");
+            });
+        }, "mihomo-stopper").start();
     }
 
     private void doRefresh() {

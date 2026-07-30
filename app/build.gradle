@@ -12,8 +12,8 @@ android {
         applicationId "com.ds2api.android"
         minSdk 24
         targetSdk 35
-        versionCode 18
-        versionName "4.6.1-mihomo-vision-fix11"
+        versionCode 19
+        versionName "4.6.1-mihomo-vision-fix12"
     }
 
     signingConfigs {
