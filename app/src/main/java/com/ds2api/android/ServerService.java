@@ -374,6 +374,9 @@ public class ServerService extends Service {
         }
         if (mihomo == null || !mihomo.optBoolean("enabled", false)) {
             LogStore.get().log("APP", "mihomo 代理桥未启用，跳过");
+            // 清理历史残留的死代理条目：旧版本可能注入过 mihomo-* 条目，禁用后端口不监听，
+            // 若不清会让 ds2api 仍指向死 SOCKS5 端口导致全部 ECONNREFUSED。
+            MihomoManager.clearProxiesFromConfig(configFile);
             return;
         }
         // 检查是否有可用的订阅（支持新格式 subscriptions 数组 + 旧格式 subscription_url）
@@ -394,6 +397,9 @@ public class ServerService extends Service {
         }
         if (!hasSub) {
             LogStore.get().log("APP", "mihomo 已启用但未配置订阅地址，跳过");
+            // 订阅全空时 mihomo 不会启动，端口不监听。清理可能残留的死代理条目，
+            // 避免 ds2api 指向死 SOCKS5 端口导致全部 ECONNREFUSED。
+            MihomoManager.clearProxiesFromConfig(configFile);
             return;
         }
 

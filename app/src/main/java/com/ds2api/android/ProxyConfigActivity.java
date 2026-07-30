@@ -1066,6 +1066,13 @@ public class ProxyConfigActivity extends Activity {
 
     private void doStopMihomo() {
         MihomoManager.stop();
+        // 停止后 SOCKS5 端口不再监听，必须清理 config.json 的 mihomo-* 代理条目，
+        // 否则 ds2api 仍指向死端口导致全部请求 ECONNREFUSED。
+        new Thread(() -> {
+            try {
+                MihomoManager.clearProxiesFromConfig(new File(getFilesDir(), "config.json"));
+            } catch (Throwable ignored) {}
+        }, "proxy-cleanup").start();
         refreshMihomoStatus();
         subNodeCache.clear();
         toast("mihomo 已停止");
@@ -1164,6 +1171,15 @@ public class ProxyConfigActivity extends Activity {
                         runOnUiThread(() -> toast("重启失败: " + t2.getMessage()));
                     }
                 }, "mihomo-restart").start();
+            } else {
+                // mihomo 未运行时保存：若 enabled 被取消勾选或此前注入过代理，
+                // 必须清理 config.json 的 mihomo-* 死代理条目，否则 ds2api 下次启动
+                // 仍指向未监听的 SOCKS5 端口导致全部 ECONNREFUSED。
+                new Thread(() -> {
+                    try {
+                        MihomoManager.clearProxiesFromConfig(new File(getFilesDir(), "config.json"));
+                    } catch (Throwable ignored) {}
+                }, "proxy-cleanup").start();
             }
         } catch (Throwable t) {
             toast("保存失败: " + t.getMessage());
