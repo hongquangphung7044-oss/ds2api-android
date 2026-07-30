@@ -1032,9 +1032,18 @@ public class ProxyConfigActivity extends Activity {
             try {
                 File workDir = new File(getFilesDir(), "mihomo");
                 MihomoManager.start(this, workDir, mihomoConfig);
+                // 修复 C2：start() 可能因端口冲突递增 socks5_base_port/api_port 或新生成
+                // api_secret，并写回 mihomoConfig 对象。必须落盘，否则下次启动读到旧值，
+                // 导致端口错位或 secret 不匹配(API 401)。与 doSave/ServerService 保持一致。
+                writeMihomoConfig();
                 boolean ready = MihomoManager.probeReady();
                 if (ready) {
                     MihomoManager.applyNodeSelection(mihomoConfig);
+                    // 修复 C4 一致性：独立启动 mihomo 后也同步 config.json 代理条目，
+                    // 用当前实际 SOCKS5 端口。这样无论 ds2api 是否已运行，config.json
+                    // 都指向正确端口，下次 ds2api 启动即可用。无绑定时该方法会清理旧条目。
+                    File cfgFile = new File(getFilesDir(), "config.json");
+                    MihomoManager.injectProxiesIntoConfig(cfgFile, mihomoConfig);
                     fetchNodes();
                 }
                 runOnUiThread(() -> {
