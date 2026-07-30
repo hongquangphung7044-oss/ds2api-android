@@ -94,7 +94,8 @@ public class ProxyConfigActivity extends Activity {
     }
 
     /** fetchNodes 并发保护：onCreate 与 onResume 可能同时触发，避免两个线程并发改缓存导致崩溃 */
-    private volatile boolean fetchNodesRunning = false;
+    private final java.util.concurrent.atomic.AtomicBoolean fetchNodesRunning =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -846,51 +847,56 @@ public class ProxyConfigActivity extends Activity {
         }
         final String groupName = "acc-" + accIndex;
 
-        testBtn.setEnabled(false);
-        testBtn.setText("测试中...");
-        // 先重置所有徽章
+        // 在 UI 线程上先快照每行的已选节点名 + 延迟徽章引用，
+        // 避免后台线程访问 Spinner（非线程安全）和遍历 nodeRows（用户可能同时增删行）
+        final List<String[]> rowSnapshots = new ArrayList<>();  // 每项 {nodeName, rowIdentity}
+        final List<TextView> delayLabels = new ArrayList<>();
         for (NodeRow r : nodeRows) {
+            String nodeName = "";
+            if (r.nodeSpinner.getSelectedItem() != null) {
+                nodeName = r.nodeSpinner.getSelectedItem().toString();
+            }
+            rowSnapshots.add(new String[]{nodeName, String.valueOf(System.identityHashCode(r))});
+            delayLabels.add(r.delayLabel);
+            // 重置徽章
             r.delayLabel.setText("···");
             r.delayLabel.setTextColor(Color.parseColor(COLOR_GRAY));
             r.delayLabel.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
         }
 
+        testBtn.setEnabled(false);
+        testBtn.setText("测试中...");
+
         new Thread(() -> {
             // 批量测试该账号涉及的所有订阅 provider 的节点延迟
             java.util.Map<String, Integer> delayMap = MihomoManager.testProvidersDelay(groupName, providerNames);
             LogStore.get().log("UI", "延迟测试完成，delayMap 大小=" + delayMap.size()
-                    + "，将更新 " + nodeRows.size() + " 个已选节点徽章");
+                    + "，将更新 " + rowSnapshots.size() + " 个已选节点徽章");
             // 如果 healthcheck 没拿到任何数据，回退到逐个测试已选节点
             if (delayMap.isEmpty()) {
-                for (int i = 0; i < nodeRows.size(); i++) {
-                    NodeRow r = nodeRows.get(i);
-                    Object sel = r.nodeSpinner.getSelectedItem();
-                    if (sel == null) continue;
-                    String nodeName = sel.toString();
+                for (int i = 0; i < rowSnapshots.size(); i++) {
+                    String nodeName = rowSnapshots.get(i)[0];
                     if ("（未选择）".equals(nodeName) || nodeName.isEmpty()) continue;
                     int delay = MihomoManager.testNodeDelay(nodeName);
-                    runOnUiThread(() -> updateDelayBadge(r.delayLabel, delay));
+                    final TextView lbl = delayLabels.get(i);
+                    runOnUiThread(() -> updateDelayBadge(lbl, delay));
                 }
             } else {
-                // 更新已选节点的延迟徽章
+                // 更新已选节点的延迟徽章（用快照的节点名，不碰 Spinner）
                 int matched = 0;
-                for (NodeRow r : nodeRows) {
-                    Object sel = r.nodeSpinner.getSelectedItem();
-                    if (sel == null) {
-                        runOnUiThread(() -> r.delayLabel.setText("—"));
-                        continue;
-                    }
-                    String nodeName = sel.toString();
+                for (int i = 0; i < rowSnapshots.size(); i++) {
+                    String nodeName = rowSnapshots.get(i)[0];
+                    final TextView lbl = delayLabels.get(i);
                     if ("（未选择）".equals(nodeName) || nodeName.isEmpty()) {
-                        runOnUiThread(() -> r.delayLabel.setText("—"));
+                        runOnUiThread(() -> lbl.setText("—"));
                         continue;
                     }
                     Integer delay = delayMap.get(nodeName);
                     if (delay != null) matched++;
                     int delayVal = delay != null ? delay : -1;
-                    runOnUiThread(() -> updateDelayBadge(r.delayLabel, delayVal));
+                    runOnUiThread(() -> updateDelayBadge(lbl, delayVal));
                 }
-                LogStore.get().log("UI", "延迟徽章更新完成，匹配 " + matched + "/" + nodeRows.size()
+                LogStore.get().log("UI", "延迟徽章更新完成，匹配 " + matched + "/" + rowSnapshots.size()
                         + " 个已选节点");
             }
             // 填充全节点延迟列表（按延迟升序，不可用节点排最后）
@@ -1169,8 +1175,8 @@ public class ProxyConfigActivity extends Activity {
     private void fetchNodes() {
         // 并发保护：onCreate 与 onResume 可能同时触发，避免两个线程并发 clear/put 缓存
         // 导致 LinkedHashMap 内部链表损坏（ConcurrentModificationException）→ 进程崩溃且无日志
-        if (fetchNodesRunning) return;
-        fetchNodesRunning = true;
+        // AtomicBoolean.compareAndSet 原子操作，消除 check-then-set 竞态
+        if (!fetchNodesRunning.compareAndSet(false, true)) return;
         try {
             if (!MihomoManager.isRunning()) {
                 runOnUiThread(() -> {
@@ -1221,7 +1227,7 @@ public class ProxyConfigActivity extends Activity {
             android.util.Log.e("ProxyConfig", "fetchNodes 失败", t);
             LogStore.get().log("UI", "拉取节点失败: " + t.getMessage());
         } finally {
-            fetchNodesRunning = false;
+            fetchNodesRunning.set(false);
         }
     }
 

@@ -428,25 +428,17 @@ public final class MihomoManager {
         }
 
         // 2. 逐账号尝试切换到用户选的主节点（nodes[0]）
-        //    fallback group 自动管理，这里只尝试固定首选；失败由 fallback 兜底
+        //    fallback group 自动管理节点选择，这里只尝试固定首选；
+        //    mihomo fallback 通常不支持手动 PUT 切换，故只试 1 次不重试，避免浪费启动时间
         for (AccountBinding b : bindings) {
             if (b.nodes.isEmpty()) continue;
             NodeRef primary = b.nodes.get(0);
-            boolean switched = false;
-            for (int attempt = 0; attempt < 3; attempt++) {
-                if (switchNode(b.groupName, primary.nodeName)) {
-                    LogStore.get().log(TAG, "账号 " + b.accountIdentifier
-                            + " → 主节点: " + primary.nodeName
-                            + "（fallback 故障转移已启用，主节点失效自动切备用）");
-                    switched = true;
-                    break;
-                }
-                if (attempt < 2) {
-                    try { Thread.sleep(800); } catch (InterruptedException ignored) { break; }
-                }
-            }
-            if (!switched) {
-                // PUT 失败不影响功能：fallback 自动选第一个可用节点
+            if (switchNode(b.groupName, primary.nodeName)) {
+                LogStore.get().log(TAG, "账号 " + b.accountIdentifier
+                        + " → 主节点: " + primary.nodeName
+                        + "（fallback 故障转移已启用，主节点失效自动切备用）");
+            } else {
+                // PUT 失败不影响功能：fallback 自动按 proxies 顺序选第一个可用节点
                 LogStore.get().log(TAG, "账号 " + b.accountIdentifier
                         + " 主节点固定未生效（fallback 将自动选择可用节点）");
             }
@@ -503,18 +495,26 @@ public final class MihomoManager {
         // - health-check lazy: true 只在 group 有流量经过时才探活（对话时探测，息屏零探活省电）
         // - interval: 600 lazy 模式下每 10 分钟最多探活一次
         // - 主节点恢复后 fallback 自动切回主节点
-        // 容错：若该账号无有效节点，回退为 proxies: [DIRECT]，避免空 group 报错
+        // 容错：过滤掉所属订阅下载失败的节点（否则 mihomo 因节点不存在报错导致整个 config 加载失败）；
+        //       过滤后无任何可用节点则回退 proxies: [DIRECT]
         sb.append("proxy-groups:\n");
         for (AccountBinding b : bindings) {
             sb.append("  - name: ").append(b.groupName).append("\n");
             sb.append("    type: fallback\n");
-            if (!b.nodes.isEmpty()) {
+            // 只保留所属订阅在 okSubs（已下载成功）中的节点
+            List<NodeRef> validNodes = new ArrayList<>();
+            for (NodeRef ref : b.nodes) {
+                if (subNameToProvider.containsKey(ref.subscriptionName)) {
+                    validNodes.add(ref);
+                }
+            }
+            if (!validNodes.isEmpty()) {
                 // 用 proxies 明确引用用户选的节点（按优先级），跨订阅混合
                 // 节点名来自 provider，mihomo 加载 provider 后节点名全局可见
                 sb.append("    proxies: [");
-                for (int k = 0; k < b.nodes.size(); k++) {
+                for (int k = 0; k < validNodes.size(); k++) {
                     if (k > 0) sb.append(", ");
-                    sb.append("'").append(escapeYamlSingle(b.nodes.get(k).nodeName)).append("'");
+                    sb.append("'").append(escapeYamlSingle(validNodes.get(k).nodeName)).append("'");
                 }
                 sb.append("]\n");
             } else {
