@@ -171,19 +171,14 @@ public final class MihomoManager {
             LogStore.get().log(TAG, "无账号节点绑定，mihomo 仅作代理桥待命");
         }
 
-        // 4. 只用下载成功的订阅生成 config.yaml（避免引用不存在的 provider 文件）
-        //    同时用 provider 实际节点名过滤 bindings，避免机场改名/下架后引用不存在
-        //    的节点名导致 mihomo 整个 config 加载失败（所有账号代理失效）
-        //    注意：filterBindingsByProviderNodes 的结果只用于生成 config.yaml（启动 mihomo），
-        //    不回写 mihomoConfig.account_bindings。本地 YAML 解析可能漏节点（flow style、
-        //    name 非首字段等），若用它回写磁盘会误删有效节点 → UI 显示"未选择"。
-        //    回写磁盘的权威修剪在 mihomo 启动成功后用 API 拿真实节点列表进行（pruneByApi）。
-        java.util.Map<String, java.util.Set<String>> providerNodeNames =
-                parseProviderNodeNames(providersDir, okSubs);
-        List<AccountBinding> filteredBindings =
-                filterBindingsByProviderNodes(okBindings, providerNodeNames);
+        // 4. 生成 config.yaml。不过滤 binding 节点：本地 YAML 解析不可靠（漏 flow style、
+        //    name 非首字段等），误删有效节点会导致用户节点绑定丢失、config.yaml 里该账号
+        //    fallback group 无节点可用。改为保留所有 binding 节点直接生成 config.yaml，
+        //    让 mihomo 自己校验：若引用了不存在的节点名，mihomo fatal 报错，由
+        //    attemptAutoRecover 解析真实 fatal 日志逐个剔除（mihomo 报的是权威错误）。
+        //    这样有效节点永远不会被误删，只有真正不存在的节点才会被剔除。
         File configFile = new File(workDir, "config.yaml");
-        String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, filteredBindings);
+        String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, okBindings);
         try (OutputStream out = new FileOutputStream(configFile)) {
             out.write(yaml.getBytes(StandardCharsets.UTF_8));
         }
@@ -345,14 +340,9 @@ public final class MihomoManager {
                         okSubs.add(sub);
                     }
                 }
-                java.util.Map<String, java.util.Set<String>> providerNodeNames =
-                        parseProviderNodeNames(providersDir, okSubs);
-                List<AccountBinding> filteredBindings =
-                        filterBindingsByProviderNodes(okBindings, providerNodeNames);
-                // 注意：不回写 mihomoConfig，避免本地解析漏节点误删有效节点。
-                // attemptAutoRecover 已通过剔除 badNode 修改了 config.account_bindings，
-                // 调用方落盘时会保存剔除后的配置（这部分是基于 mihomo fatal 真实报错，可靠）。
-                String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, filteredBindings);
+                // 不过滤：attemptAutoRecover 已剔除 mihomo fatal 报错的 badNode，
+                // 其余节点保留让 mihomo 校验。本地 filterBindingsByProviderNodes 不可靠已弃用。
+                String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, okBindings);
                 File configFile = new File(workDir, "config.yaml");
                 try (OutputStream out = new FileOutputStream(configFile)) {
                     out.write(yaml.getBytes(StandardCharsets.UTF_8));
@@ -514,17 +504,12 @@ public final class MihomoManager {
             LogStore.get().log(TAG, "更新订阅失败：所有订阅下载失败，保持旧配置不变");
             return 0;
         }
-        // 重新生成 config.yaml（用实际拉取的节点列表过滤失效节点名，C5）
+        // 重新生成 config.yaml（不过滤 binding 节点，避免本地解析漏节点误删有效节点）
         try {
             int socks5Base = config.optInt("socks5_base_port", socks5BasePort);
             int updateInterval = config.optInt("subscription_update_interval", 3600);
             List<AccountBinding> bindings = parseBindings(config, socks5Base, subs);
-            // 用 provider 实际节点名过滤 bindings（机场改名/下架后旧节点名过期）
-            java.util.Map<String, java.util.Set<String>> providerNodeNames =
-                    parseProviderNodeNames(providersDir, okSubs);
-            List<AccountBinding> filteredBindings =
-                    filterBindingsByProviderNodes(bindings, providerNodeNames);
-            String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, filteredBindings);
+            String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, bindings);
             File configFile = new File(workDir, "config.yaml");
             try (OutputStream out = new FileOutputStream(configFile)) {
                 out.write(yaml.getBytes(StandardCharsets.UTF_8));
