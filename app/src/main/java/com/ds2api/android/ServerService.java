@@ -449,6 +449,18 @@ public class ServerService extends Service {
         // applyNodeSelection 内部会等待 provider 节点加载完成，无需额外 sleep
         MihomoManager.applyNodeSelection(mihomo);
 
+        // mihomo 已就绪、provider 已加载，用 API 拉真实节点列表修剪 account_bindings。
+        // 用 mihomo 权威数据剔除不存在的节点名（机场改名/下架），避免下次启动重复 fatal。
+        // 比 start() 里本地 YAML 解析可靠（本地解析漏 flow style 等会误删有效节点）。
+        if (MihomoManager.pruneByApi(mihomo)) {
+            try {
+                atomicWrite(mihomoFile, mihomo.toString(2).getBytes(StandardCharsets.UTF_8));
+                LogStore.get().log("APP", "已用 mihomo API 修剪 account_bindings 并落盘");
+            } catch (Throwable t) {
+                LogStore.get().log("APP", "API 修剪后落盘失败（不影响本次运行）: " + t.getMessage());
+            }
+        }
+
         // 注入 Proxy 条目到 config.json（用当前实际 SOCKS5 端口，端口冲突递增后也能同步）
         MihomoManager.injectProxiesIntoConfig(configFile, mihomo);
 

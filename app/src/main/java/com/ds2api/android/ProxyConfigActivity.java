@@ -1106,6 +1106,11 @@ public class ProxyConfigActivity extends Activity {
                 }
                 if (ready) {
                     MihomoManager.applyNodeSelection(mihomoConfig);
+                    // mihomo 就绪后用 API 真实节点列表修剪 account_bindings 并落盘
+                    // （本地 YAML 解析可能漏节点，用它回写磁盘会误删有效节点→UI 显示未选择）
+                    if (MihomoManager.pruneByApi(mihomoConfig)) {
+                        writeMihomoConfig();
+                    }
                     // 修复 C4 一致性：独立启动 mihomo 后也同步 config.json 代理条目，
                     // 用当前实际 SOCKS5 端口。这样无论 ds2api 是否已运行，config.json
                     // 都指向正确端口，下次 ds2api 启动即可用。无绑定时该方法会清理旧条目。
@@ -1249,6 +1254,10 @@ public class ProxyConfigActivity extends Activity {
                         }
                         if (ready) {
                             MihomoManager.applyNodeSelection(mihomoConfig);
+                            // mihomo 就绪后用 API 真实节点列表修剪 account_bindings 并落盘
+                            if (MihomoManager.pruneByApi(mihomoConfig)) {
+                                writeMihomoConfig();
+                            }
                             // 修复 C4：重启后 mihomo 的 SOCKS5 端口可能已变（端口避让），
                             // 必须重新注入 Proxy 到 config.json，否则 ds2api 仍指向旧端口。
                             // 即使 ds2api 当前未运行，下次启动 ServerService 会读到正确的代理端口。
