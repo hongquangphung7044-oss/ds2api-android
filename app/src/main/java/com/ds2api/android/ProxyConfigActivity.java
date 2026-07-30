@@ -355,8 +355,59 @@ public class ProxyConfigActivity extends Activity {
         urlLp.topMargin = dp(4);
         row.addView(urlField, urlLp);
 
-        // 用 tag 存储控件引用，保存时遍历读取
-        row.setTag(new Object[]{nameField, urlField, subEnabled});
+        // 用 tag 存储控件引用，保存时遍历读取；另存延迟列表引用供测延迟用
+        ScrollView delayListScroll = new ScrollView(this);
+        LinearLayout.LayoutParams dlsLp = new LinearLayout.LayoutParams(-1, dp(180));
+        dlsLp.topMargin = dp(6);
+        delayListScroll.setLayoutParams(dlsLp);
+        delayListScroll.setBackgroundColor(Color.parseColor("#F8FAFC"));
+        delayListScroll.setVisibility(View.GONE);
+        TextView delayListText = new TextView(this);
+        delayListText.setTextSize(11);
+        delayListText.setTypeface(Typeface.MONOSPACE);
+        delayListText.setPadding(dp(8), dp(8), dp(8), dp(8));
+        delayListText.setTextColor(Color.parseColor(COLOR_TEXT));
+        delayListScroll.addView(delayListText);
+        delayListScroll.setOnTouchListener((v, event) -> {
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE) {
+                v.getParent().requestDisallowInterceptTouchEvent(true);
+            }
+            return false;
+        });
+
+        // 第三行：测试延迟按钮
+        LinearLayout subBtnRow = new LinearLayout(this);
+        subBtnRow.setOrientation(LinearLayout.HORIZONTAL);
+        subBtnRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams sbrLp = new LinearLayout.LayoutParams(-1, -2);
+        sbrLp.topMargin = dp(6);
+        subBtnRow.setLayoutParams(sbrLp);
+
+        Button testDelayBtn = makeSecondaryButton("测试延迟", null);
+        TextView subStatus = new TextView(this);
+        subStatus.setTextSize(11);
+        subStatus.setTextColor(Color.parseColor(COLOR_GRAY));
+        subStatus.setPadding(dp(8), 0, 0, 0);
+        subBtnRow.addView(testDelayBtn, new LinearLayout.LayoutParams(-2, dp(36)));
+        subBtnRow.addView(subStatus, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        row.addView(subBtnRow);
+        row.addView(delayListScroll);
+
+        // tag: [nameField, urlField, subEnabled, delayListScroll, delayListText, testDelayBtn, subStatus]
+        row.setTag(new Object[]{nameField, urlField, subEnabled,
+                delayListScroll, delayListText, testDelayBtn, subStatus});
+
+        // 订阅名作为测延迟的标识：保存时才落盘，但测延迟可即时用 nameField 当前值
+        testDelayBtn.setOnClickListener(v -> {
+            String subName = nameField.getText().toString().trim();
+            if (subName.isEmpty()) {
+                toast("请先填写订阅名称");
+                return;
+            }
+            doTestSubscriptionDelay(subName, testDelayBtn, subStatus, delayListScroll, delayListText);
+        });
 
         subscriptionListContainer.addView(row);
         // 新增订阅后，立即刷新所有账号卡片的订阅选择下拉（修复"新加订阅不刷新"）
@@ -594,46 +645,16 @@ public class ProxyConfigActivity extends Activity {
 
         Button addBtn = makeSecondaryButton("+ 添加备用", v -> {
             int idx = nodeRows.size();
-            // 插到按钮行之前（btnRow 是倒数第二个子视图，delayListScroll 是最后一个）
             int insertAt = card.indexOfChild(btnRow);
             card.addView(buildNodeRow(nodeRows, idx, "", "", card, subNames), insertAt);
         });
         btnRow.addView(addBtn, new LinearLayout.LayoutParams(-2, dp(38)));
-
-        Button testBtn = makeSecondaryButton("测试延迟", v -> {});
-        testBtn.setOnClickListener(v -> doTestDelay(nodeRows, testBtn, card, accIndex));
-        btnRow.addView(testBtn, new LinearLayout.LayoutParams(-2, dp(38)));
 
         Button verifyBtn = makeSecondaryButton("验证代理", v -> doVerifyProxy(accIndex, verifyLabel));
         btnRow.addView(verifyBtn, new LinearLayout.LayoutParams(-2, dp(38)));
 
         card.addView(btnRow);
         card.addView(verifyLabel);
-
-        // 全节点延迟列表区域（测延迟后显示所有节点+延迟，可滚动）
-        ScrollView delayListScroll = new ScrollView(this);
-        LinearLayout.LayoutParams dlsLp = new LinearLayout.LayoutParams(-1, dp(180));
-        dlsLp.topMargin = dp(6);
-        delayListScroll.setLayoutParams(dlsLp);
-        delayListScroll.setBackgroundColor(Color.parseColor("#F8FAFC"));
-        delayListScroll.setVisibility(View.GONE); // 默认隐藏，测延迟后显示
-        TextView delayListText = new TextView(this);
-        delayListText.setTextSize(11);
-        delayListText.setTypeface(Typeface.MONOSPACE);
-        delayListText.setPadding(dp(8), dp(8), dp(8), dp(8));
-        delayListText.setTextColor(Color.parseColor(COLOR_TEXT));
-        delayListScroll.addView(delayListText);
-        // 修复嵌套 ScrollView 滑动冲突：触摸内层延迟列表时禁止外层 ScrollView 拦截事件
-        delayListScroll.setOnTouchListener((v, event) -> {
-            int action = event.getActionMasked();
-            if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE) {
-                v.getParent().requestDisallowInterceptTouchEvent(true);
-            }
-            return false;
-        });
-        card.addView(delayListScroll);
-        // 保存引用供 doTestDelay 使用（用包装数组做 tag，避免 setTag(int) 要求 app 资源 ID）
-        card.setTag(new Object[]{delayListScroll, delayListText});
 
         return card;
     }
@@ -806,127 +827,116 @@ public class ProxyConfigActivity extends Activity {
     }
 
     /**
-     * 测试该账号所有节点行涉及订阅的全部节点延迟（healthcheck 批量测），
-     * 然后更新已选节点行的延迟徽章。一个账号跨多订阅时，合并所有涉及订阅的 provider
-     * 一起测，只测这些 provider，不会测到账号未涉及的其他机场节点。
+     * 测试单个订阅的全部节点延迟（healthcheck 批量测），只测该订阅 provider，
+     * 绝不会测到其他订阅。测完：
+     * 1. 弹出该订阅的节点延迟列表（按延迟升序）
+     * 2. 回填所有账号卡片里选中该订阅的节点行徽章
      */
-    private void doTestDelay(List<NodeRow> nodeRows, Button testBtn, LinearLayout card, int accIndex) {
+    private void doTestSubscriptionDelay(String subName, Button testBtn, TextView subStatus,
+                                         ScrollView delayListScroll, TextView delayListText) {
         if (!MihomoManager.isRunning()) {
             toast("请先启动 mihomo");
             return;
         }
-        // 收集该账号所有节点行选中的订阅名（去重），并映射到 provider 名
-        // 只测这些 provider，避免测到账号未涉及的其他机场节点
-        java.util.Set<String> subNames = new java.util.LinkedHashSet<>();
-        for (NodeRow row : nodeRows) {
-            if (row.subSpinner.getSelectedItemPosition() > 0) {
-                subNames.add(row.subSpinner.getSelectedItem().toString());
-            }
-        }
-        if (subNames.isEmpty()) {
-            toast("请先为至少一个节点选择订阅");
-            return;
-        }
-        final List<String> providerNames = new ArrayList<>();
-        for (String sn : subNames) {
-            String pn = subNameToProvider.get(sn);
-            // 兜底：映射缺失时从 mihomoConfig 重建
-            if (pn == null) {
-                JSONArray subs = mihomoConfig.optJSONArray("subscriptions");
-                if (subs != null) {
-                    for (int i = 0; i < subs.length(); i++) {
-                        JSONObject s = subs.optJSONObject(i);
-                        if (s != null && sn.equals(s.optString("name", "订阅" + (i + 1)))) {
-                            pn = "sub-" + i;
-                            break;
-                        }
+        // 订阅名 → provider 名
+        String providerName = subNameToProvider.get(subName);
+        if (providerName == null) {
+            JSONArray subs = mihomoConfig.optJSONArray("subscriptions");
+            if (subs != null) {
+                for (int i = 0; i < subs.length(); i++) {
+                    JSONObject s = subs.optJSONObject(i);
+                    if (s != null && subName.equals(s.optString("name", "订阅" + (i + 1)))) {
+                        providerName = "sub-" + i;
+                        break;
                     }
                 }
             }
-            if (pn != null && !providerNames.contains(pn)) providerNames.add(pn);
         }
-        final String groupName = "acc-" + accIndex;
+        if (providerName == null) {
+            toast("找不到订阅 [" + subName + "] 对应的 provider，请先保存并启动 mihomo");
+            return;
+        }
+        final String finalProviderName = providerName;
 
-        // 在 UI 线程上先快照每行的已选节点名 + 延迟徽章引用，
-        // 避免后台线程访问 Spinner（非线程安全）和遍历 nodeRows（用户可能同时增删行）
-        final List<String[]> rowSnapshots = new ArrayList<>();  // 每项 {nodeName, rowIdentity}
-        final List<TextView> delayLabels = new ArrayList<>();
-        for (NodeRow r : nodeRows) {
-            String nodeName = "";
-            if (r.nodeSpinner.getSelectedItem() != null) {
-                nodeName = r.nodeSpinner.getSelectedItem().toString();
+        // 主线程快照：所有账号卡片里选中该订阅的节点行 {rowIdentity, nodeName, delayLabel}
+        // 避免后台线程访问 Spinner（非线程安全）
+        final List<Object[]> badgeTargets = new ArrayList<>();  // {nodeName, delayLabel}
+        for (List<NodeRow> rows : accountNodeRows) {
+            for (NodeRow r : rows) {
+                if (r.subSpinner.getSelectedItemPosition() > 0
+                        && subName.equals(r.subSpinner.getSelectedItem().toString())) {
+                    String nodeName = "";
+                    if (r.nodeSpinner.getSelectedItem() != null) {
+                        nodeName = r.nodeSpinner.getSelectedItem().toString();
+                    }
+                    badgeTargets.add(new Object[]{nodeName, r.delayLabel});
+                    // 重置徽章
+                    r.delayLabel.setText("···");
+                    r.delayLabel.setTextColor(Color.parseColor(COLOR_GRAY));
+                    r.delayLabel.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
+                }
             }
-            rowSnapshots.add(new String[]{nodeName, String.valueOf(System.identityHashCode(r))});
-            delayLabels.add(r.delayLabel);
-            // 重置徽章
-            r.delayLabel.setText("···");
-            r.delayLabel.setTextColor(Color.parseColor(COLOR_GRAY));
-            r.delayLabel.setBackground(roundedBackground("#F1F5F9", COLOR_DIVIDER, dp(10)));
         }
 
         testBtn.setEnabled(false);
         testBtn.setText("测试中...");
+        if (subStatus != null) subStatus.setText("正在测试...");
 
         new Thread(() -> {
-            // 批量测试该账号涉及的所有订阅 provider 的节点延迟
-            java.util.Map<String, Integer> delayMap = MihomoManager.testProvidersDelay(groupName, providerNames);
-            LogStore.get().log("UI", "延迟测试完成，delayMap 大小=" + delayMap.size()
-                    + "，将更新 " + rowSnapshots.size() + " 个已选节点徽章");
-            // 如果 healthcheck 没拿到任何数据，回退到逐个测试已选节点
-            if (delayMap.isEmpty()) {
-                for (int i = 0; i < rowSnapshots.size(); i++) {
-                    String nodeName = rowSnapshots.get(i)[0];
-                    if ("（未选择）".equals(nodeName) || nodeName.isEmpty()) continue;
-                    int delay = MihomoManager.testNodeDelay(nodeName);
-                    final TextView lbl = delayLabels.get(i);
-                    runOnUiThread(() -> updateDelayBadge(lbl, delay));
+            // 只测这一个 provider，不会测到其他订阅
+            List<String> providerNames = new ArrayList<>();
+            providerNames.add(finalProviderName);
+            java.util.Map<String, Integer> delayMap =
+                    MihomoManager.testProvidersDelay("sub-test", providerNames);
+            LogStore.get().log("UI", "订阅 [" + subName + "] 延迟测试完成，delayMap 大小="
+                    + delayMap.size() + "，待更新 " + badgeTargets.size() + " 个徽章");
+
+            // 1. 回填账号卡片里选中该订阅的节点徽章
+            for (Object[] target : badgeTargets) {
+                String nodeName = (String) target[0];
+                final TextView lbl = (TextView) target[1];
+                if (nodeName.isEmpty() || "（未选择）".equals(nodeName)) {
+                    runOnUiThread(() -> lbl.setText("—"));
+                    continue;
                 }
-            } else {
-                // 更新已选节点的延迟徽章（用快照的节点名，不碰 Spinner）
-                int matched = 0;
-                for (int i = 0; i < rowSnapshots.size(); i++) {
-                    String nodeName = rowSnapshots.get(i)[0];
-                    final TextView lbl = delayLabels.get(i);
-                    if ("（未选择）".equals(nodeName) || nodeName.isEmpty()) {
-                        runOnUiThread(() -> lbl.setText("—"));
-                        continue;
-                    }
-                    Integer delay = delayMap.get(nodeName);
-                    if (delay != null) matched++;
-                    int delayVal = delay != null ? delay : -1;
-                    runOnUiThread(() -> updateDelayBadge(lbl, delayVal));
-                }
-                LogStore.get().log("UI", "延迟徽章更新完成，匹配 " + matched + "/" + rowSnapshots.size()
-                        + " 个已选节点");
+                Integer delay = delayMap.get(nodeName);
+                int delayVal = delay != null ? delay : -1;
+                runOnUiThread(() -> updateDelayBadge(lbl, delayVal));
             }
-            // 填充全节点延迟列表（按延迟升序，不可用节点排最后）
-            if (!delayMap.isEmpty() && card != null) {
-                Object tag = card.getTag();
-                if (tag instanceof Object[]) {
-                    Object[] arr = (Object[]) tag;
-                    if (arr.length >= 2 && arr[0] instanceof ScrollView && arr[1] instanceof TextView) {
-                        final ScrollView delayListScroll = (ScrollView) arr[0];
-                        final TextView delayListText = (TextView) arr[1];
-                        List<java.util.Map.Entry<String, Integer>> sorted = new ArrayList<>(delayMap.entrySet());
-                        java.util.Collections.sort(sorted, (a, b) -> Integer.compare(a.getValue(), b.getValue()));
-                        StringBuilder sb = new StringBuilder();
-                        sb.append("节点延迟列表（").append(delayMap.size()).append("可用）\n\n");
-                        for (java.util.Map.Entry<String, Integer> e : sorted) {
-                            sb.append("● ").append(String.format("%5dms", e.getValue()))
-                              .append("  ").append(e.getKey()).append("\n");
-                        }
-                        runOnUiThread(() -> {
-                            delayListText.setText(sb.toString());
-                            delayListScroll.setVisibility(View.VISIBLE);
-                        });
-                    }
+
+            // 2. 弹出该订阅的节点延迟列表（按延迟升序）
+            if (!delayMap.isEmpty()) {
+                List<java.util.Map.Entry<String, Integer>> sorted = new ArrayList<>(delayMap.entrySet());
+                java.util.Collections.sort(sorted, (a, b) -> Integer.compare(a.getValue(), b.getValue()));
+                StringBuilder sb = new StringBuilder();
+                sb.append("【").append(subName).append("】节点延迟（").append(delayMap.size()).append(" 可用）\n\n");
+                for (java.util.Map.Entry<String, Integer> e : sorted) {
+                    sb.append("● ").append(String.format("%5dms", e.getValue()))
+                      .append("  ").append(e.getKey()).append("\n");
                 }
+                final String finalText = sb.toString();
+                runOnUiThread(() -> {
+                    delayListText.setText(finalText);
+                    delayListScroll.setVisibility(View.VISIBLE);
+                    if (subStatus != null) {
+                        subStatus.setText(delayMap.size() + " 个节点可用");
+                    }
+                });
+            } else {
+                runOnUiThread(() -> {
+                    delayListText.setText("【" + subName + "】无可用节点\n\n"
+                            + "可能原因：\n"
+                            + "· 订阅未加载（点\"启动 mihomo\"）\n"
+                            + "· 订阅已失效（点\"更新订阅\"重新下载）");
+                    delayListScroll.setVisibility(View.VISIBLE);
+                    if (subStatus != null) subStatus.setText("无可用节点");
+                });
             }
             runOnUiThread(() -> {
                 testBtn.setEnabled(true);
-                testBtn.setText("测试全部延迟");
+                testBtn.setText("测试延迟");
             });
-        }, "delay-test").start();
+        }, "sub-delay-test").start();
     }
 
     /** 验证该账号的代理是否可用：通过 mihomo SOCKS5 端口获取出口 IP。 */
