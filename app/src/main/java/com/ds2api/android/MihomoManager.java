@@ -178,6 +178,10 @@ public final class MihomoManager {
                 parseProviderNodeNames(providersDir, okSubs);
         List<AccountBinding> filteredBindings =
                 filterBindingsByProviderNodes(okBindings, providerNodeNames);
+        // 关键修复：把过滤结果回写到 config.account_bindings，让调用方落盘 mihomo_config.json
+        // 时保存的是干净配置（已剔除失效节点）。否则磁盘仍是含失效节点的旧配置，下次启动
+        // 重复同样错误，UI 也重复显示失效节点 → "保存→重启→失效节点又回来"死循环。
+        pruneBindingsInConfig(config, filteredBindings);
         File configFile = new File(workDir, "config.yaml");
         String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, filteredBindings);
         try (OutputStream out = new FileOutputStream(configFile)) {
@@ -345,6 +349,7 @@ public final class MihomoManager {
                         parseProviderNodeNames(providersDir, okSubs);
                 List<AccountBinding> filteredBindings =
                         filterBindingsByProviderNodes(okBindings, providerNodeNames);
+                pruneBindingsInConfig(config, filteredBindings);  // 同步回写内存 config，供调用方落盘
                 String yaml = generateConfigYaml(okSubs, updateInterval, apiPort, apiSecret, filteredBindings);
                 File configFile = new File(workDir, "config.yaml");
                 try (OutputStream out = new FileOutputStream(configFile)) {
@@ -736,6 +741,41 @@ public final class MihomoManager {
                     b.currentNodeIndex, b.socksPort, b.index));
         }
         return filtered;
+    }
+
+    /**
+     * 把过滤后的 bindings 回写到 config.account_bindings，使调用方落盘
+     * mihomo_config.json 时保存干净配置（已剔除失效节点）。
+     * 保持每个账号的 account_identifier 不变，nodes 替换为过滤后的有效节点。
+     */
+    private static void pruneBindingsInConfig(JSONObject config, List<AccountBinding> filtered) {
+        JSONArray bindings = config.optJSONArray("account_bindings");
+        if (bindings == null) return;
+        // 以 account_identifier 为 key 建索引
+        java.util.Map<String, AccountBinding> byId = new java.util.HashMap<>();
+        for (AccountBinding b : filtered) {
+            byId.put(b.accountIdentifier, b);
+        }
+        for (int i = 0; i < bindings.length(); i++) {
+            JSONObject b = bindings.optJSONObject(i);
+            if (b == null) continue;
+            String id = b.optString("account_identifier", "");
+            AccountBinding fb = byId.get(id);
+            if (fb == null) continue;
+            JSONArray nodes = new JSONArray();
+            for (NodeRef ref : fb.nodes) {
+                JSONObject n = new JSONObject();
+                try {
+                    n.put("subscription", ref.subscriptionName);
+                    n.put("name", ref.nodeName);
+                } catch (org.json.JSONException ignored) {}
+                nodes.put(n);
+            }
+            try {
+                b.put("nodes", nodes);
+                b.put("current_node_index", fb.currentNodeIndex);
+            } catch (org.json.JSONException ignored) {}
+        }
     }
 
     /**

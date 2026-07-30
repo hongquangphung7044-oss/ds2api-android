@@ -538,6 +538,7 @@ public class ProxyConfigActivity extends Activity {
 
         // 收集所有订阅名供选择
         List<String> subNames = getSubscriptionNames();
+        Set<String> subNameSet = new HashSet<>(subNames);
 
         for (int i = 0; i < accounts.length(); i++) {
             JSONObject acc = accounts.optJSONObject(i);
@@ -548,6 +549,9 @@ public class ProxyConfigActivity extends Activity {
             if (identifier.isEmpty()) continue;
 
             // 收集该账号已保存的节点：优先新格式 nodes[]，兼容旧格式 node_names[]+subscription_name
+            // 关键修复：只保留订阅名仍在当前订阅列表中的节点。用户删除订阅后，旧 binding 里
+            // 引用该已删订阅的节点会被 mihomo 当作不存在的节点 → proxy not exist / not found，
+            // 导致切换失败甚至整个 config 加载失败。这里过滤掉，避免"删了订阅但 binding 残留"。
             List<String[]> existingNodes = new ArrayList<>();  // 每项 {subName, nodeName}
             for (int j = 0; j < bindings.length(); j++) {
                 JSONObject b = bindings.optJSONObject(j);
@@ -559,7 +563,12 @@ public class ProxyConfigActivity extends Activity {
                         if (n == null) continue;
                         String sn = n.optString("subscription", "").trim();
                         String nm = n.optString("name", "").trim();
-                        if (!nm.isEmpty()) existingNodes.add(new String[]{sn, nm});
+                        if (nm.isEmpty()) continue;
+                        if (!sn.isEmpty() && !subNameSet.contains(sn)) {
+                            // 订阅已被删除：跳过该节点（不显示、不保存）
+                            continue;
+                        }
+                        existingNodes.add(new String[]{sn, nm});
                     }
                 } else {
                     String sn = b.optString("subscription_name", "").trim();
@@ -567,7 +576,11 @@ public class ProxyConfigActivity extends Activity {
                     if (names != null) {
                         for (int k = 0; k < names.length(); k++) {
                             String nm = names.optString(k, "").trim();
-                            if (!nm.isEmpty()) existingNodes.add(new String[]{sn, nm});
+                            if (nm.isEmpty()) continue;
+                            if (!sn.isEmpty() && !subNameSet.contains(sn)) {
+                                continue;
+                            }
+                            existingNodes.add(new String[]{sn, nm});
                         }
                     }
                 }
@@ -1172,6 +1185,8 @@ public class ProxyConfigActivity extends Activity {
             mihomoConfig.put("enabled", enabledCheckbox.isChecked());
 
             // 收集账号绑定：每个节点带所属订阅名（支持跨订阅备用）
+            // 双保险：只保存订阅名仍在当前订阅列表中的节点，防止已删订阅的旧 binding 残留
+            Set<String> validSubNames = new HashSet<>(getSubscriptionNames());
             JSONArray bindings = new JSONArray();
             Set<String> seen = new HashSet<>();
             for (int i = 0; i < accountIdentifiers.size(); i++) {
@@ -1188,6 +1203,10 @@ public class ProxyConfigActivity extends Activity {
                     if (sel == null) continue;
                     String nodeName = sel.toString().trim();
                     if ("（未选择）".equals(nodeName) || nodeName.isEmpty()) continue;
+                    if (!subName.isEmpty() && !validSubNames.contains(subName)) {
+                        // 订阅已被删除：不保存该节点
+                        continue;
+                    }
                     JSONObject n = new JSONObject();
                     n.put("subscription", subName);
                     n.put("name", nodeName);
