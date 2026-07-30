@@ -595,6 +595,58 @@ public final class MihomoManager {
     }
 
     /**
+     * mihomo 启动成功后，用 API 拿每个订阅 provider 的真实节点列表，
+     * 重新生成 config.yaml：fallback group 的 proxies 按用户选的主→备用1→备用2
+     * 顺序写"确实存在"的节点名，再加 use 引用整个 provider 兜底，最后热重载。
+     *
+     * 两阶段启动的阶段2：阶段1 用 use-only 启动（不 fatal），阶段2 补回用户顺位。
+     * 这样：
+     * - 保留用户主/备用顺位（主节点响应超时，fallback 自动切备用1→备用2）
+     * - 过期节点名不写进 proxies（mihomo 不 fatal），但用户 binding 不删
+     * - 失效节点用户在 UI 测延迟时看到，自行更换
+     *
+     * @param config mihomo 配置 JSON（含 subscriptions + account_bindings）
+     * @return true 表示已重新生成并热重载成功
+     */
+    static boolean applyUserPriorityByApi(JSONObject config) {
+        if (!isRunning() || workDir == null) return false;
+        try {
+            List<Subscription> subs = parseSubscriptions(config);
+            File providersDir = new File(workDir, "providers");
+            int socks5Base = config.optInt("socks5_base_port", socks5BasePort);
+            int updateInterval = config.optInt("subscription_update_interval", 3600);
+            List<AccountBinding> bindings = parseBindings(config, socks5Base, subs);
+
+            // 用 mihomo API 拿每个 provider 的真实节点名集合（权威，不漏节点）
+            java.util.Map<String, java.util.Set<String>> realNodesByProvider = new java.util.HashMap<>();
+            java.util.Map<String, String> subNameToProvider = new java.util.HashMap<>();
+            for (Subscription sub : subs) {
+                subNameToProvider.put(sub.name, sub.providerName);
+                List<String> nodes = fetchNodeList(sub.providerName);
+                realNodesByProvider.put(sub.providerName, new java.util.HashSet<>(nodes));
+            }
+
+            // 重新生成 config.yaml，proxies 写用户顺位（只写存在的节点）+ use 兜底
+            String yaml = generateConfigYaml(subs, updateInterval, apiPort, apiSecret,
+                    bindings, realNodesByProvider, subNameToProvider);
+            File configFile = new File(workDir, "config.yaml");
+            try (OutputStream out = new FileOutputStream(configFile)) {
+                out.write(yaml.getBytes(StandardCharsets.UTF_8));
+            }
+            boolean reloaded = reloadConfig();
+            if (reloaded) {
+                LogStore.get().log(TAG, "已应用用户主/备用节点顺位并热重载");
+            } else {
+                LogStore.get().log(TAG, "热重载用户顺位失败（fallback 仍可用 use 池自动故障转移）");
+            }
+            return reloaded;
+        } catch (Throwable t) {
+            LogStore.get().log(TAG, "应用用户顺位失败: " + t.getMessage());
+            return false;
+        }
+    }
+
+    /**
      * 启动/热重载后，尝试把每个账号切换到用户选定的主节点。
      *
      * group 现为 fallback 类型：内核按 proxies 列表顺序自动选第一个可用节点，
@@ -645,57 +697,6 @@ public final class MihomoManager {
                         + " 主节点固定未生效（fallback 将自动选择可用节点）");
             }
         }
-    }
-
-    /**
-     * mihomo 启动成功后，用 API 拉取每个订阅 provider 的真实节点名列表，
-     * 据此修剪 config.account_bindings 中引用了不存在节点的 NodeRef。
-     * 与启动前 filterBindingsByProviderNodes（本地解析 YAML，可能漏节点）不同，
-     * 本方法用 mihomo 已加载的权威节点列表，不会误删有效节点。
-     * 调用方在 mihomo 就绪后调用，然后落盘 mihomo_config.json。
-     * @return true 表示有节点被剔除（需落盘）
-     */
-    static boolean pruneByApi(JSONObject config) {
-        if (!isRunning()) return false;
-        JSONArray bindings = config.optJSONArray("account_bindings");
-        if (bindings == null) return false;
-        // 拉取每个订阅 provider 的真实节点名
-        java.util.Map<String, java.util.Set<String>> realNames = new java.util.HashMap<>();
-        JSONArray subs = config.optJSONArray("subscriptions");
-        if (subs != null) {
-            for (int i = 0; i < subs.length(); i++) {
-                JSONObject s = subs.optJSONObject(i);
-                if (s == null) continue;
-                String name = s.optString("name", "订阅" + (i + 1));
-                List<String> nodes = fetchNodeList("sub-" + i);
-                realNames.put(name, new java.util.HashSet<>(nodes));
-            }
-        }
-        boolean changed = false;
-        for (int i = 0; i < bindings.length(); i++) {
-            JSONObject b = bindings.optJSONObject(i);
-            if (b == null) continue;
-            JSONArray nodes = b.optJSONArray("nodes");
-            if (nodes == null) continue;
-            JSONArray kept = new JSONArray();
-            for (int j = 0; j < nodes.length(); j++) {
-                JSONObject n = nodes.optJSONObject(j);
-                if (n == null) { kept.put(n); continue; }
-                String sn = n.optString("subscription", "");
-                String nm = n.optString("name", "");
-                // provider 未加载（realNames 无此订阅或空集）时保留，避免误删
-                java.util.Set<String> names = realNames.get(sn);
-                if (names == null || names.isEmpty() || names.contains(nm)) {
-                    kept.put(n);
-                } else {
-                    changed = true;
-                    LogStore.get().log(TAG, "API 修剪：账号 " + b.optString("account_identifier", "")
-                            + " 剔除不存在节点 [" + nm + "]（订阅 " + sn + "）");
-                }
-            }
-            try { b.put("nodes", kept); } catch (org.json.JSONException ignored) {}
-        }
-        return changed;
     }
 
     // ========== 配置生成 ==========
@@ -792,6 +793,23 @@ public final class MihomoManager {
     static String generateConfigYaml(List<Subscription> subs, int updateInterval,
                                      int apiPort, String secret,
                                      List<AccountBinding> bindings) {
+        return generateConfigYaml(subs, updateInterval, apiPort, secret, bindings,
+                null, null);
+    }
+
+    /**
+     * 生成 mihomo config.yaml（支持用户顺位模式）。
+     * @param realNodesByProvider 非 null 时启用顺位模式：proxies 写用户选的节点名（只写确实
+     *                             存在于对应 provider 的），保留主→备用1→备用2 顺位，加 use 兜底。
+     *                             为 null 时用 use-only 模式（启动阶段，不写节点名，不 fatal）。
+     * @param realSubNameToProvider 顺位模式下的订阅名→provider 名映射（与 realNodesByProvider 配套）
+     */
+    static String generateConfigYaml(List<Subscription> subs, int updateInterval,
+                                     int apiPort, String secret,
+                                     List<AccountBinding> bindings,
+                                     java.util.Map<String, java.util.Set<String>> realNodesByProvider,
+                                     java.util.Map<String, String> realSubNameToProvider) {
+        boolean priorityMode = realNodesByProvider != null && realSubNameToProvider != null;
         StringBuilder sb = new StringBuilder();
         sb.append("# 自动生成，请勿手动编辑\n");
         sb.append("allow-lan: false\n");
@@ -830,11 +848,17 @@ public final class MihomoManager {
         // - health-check lazy: true 只在 group 有流量经过时才探活（对话时探测，息屏零探活省电）
         // - interval: 600 lazy 模式下每 10 分钟最多探活一次
         // - 主节点恢复后 fallback 自动切回主节点
-        // 每账号一个 fallback group，用 use 引用整个 provider 节点池（不逐个写节点名）。
-        // 关键：不把用户 binding 的节点名写进 proxies，避免机场改名/下架后节点名不存在
-        // 导致 mihomo fatal 整个 config 加载失败。用户选的主节点优先级通过 applyNodeSelection
-        // 启动后调 API 切换（fallback 不支持 PUT 固定，但 fallback 按顺序自动故障转移已够用）。
-        // 失效节点：用户在 UI 测延迟时自然看到，自行更换——不自动剔除用户配置。
+        // 每账号一个 fallback group。
+        // 两阶段策略保证"不 fatal + 保留用户主/备用顺位"：
+        // 阶段1（启动）：proxies 只写 DIRECT + use 引用整个 provider 节点池，不写用户节点名。
+        //              这样无论 provider 有哪些节点、用户 binding 里有没有过期节点名，mihomo
+        //              都不会 fatal，能正常启动。
+        // 阶段2（applyUserPriorityByApi，启动后）：用 mihomo API 拿 provider 真实节点列表，
+        //              把用户选的节点名（只写确实存在的）按主→备用1→备用2 顺序写进 proxies，
+        //              再加 use 兜底，热重载。这样：
+        //              - 保留用户顺位（主节点响应超时自动切备用1→备用2）
+        //              - 过期节点名不写进 proxies（mihomo 不 fatal），但用户 binding 不删
+        //              - 失效节点用户在 UI 测延迟时看到，自行更换
         sb.append("proxy-groups:\n");
         // provider 名集合（去重），用于无 binding 账号的兜底
         java.util.Set<String> allProviderNames = new java.util.LinkedHashSet<>();
@@ -852,15 +876,48 @@ public final class MihomoManager {
             }
             // 兜底：账号未选任何订阅或订阅已删除，用所有 provider
             if (useProviders.isEmpty()) useProviders.addAll(allProviderNames);
-            if (useProviders.isEmpty()) {
-                // 完全无 provider（订阅全部下载失败）：DIRECT 兜底保证端口能监听
-                sb.append("    proxies: [DIRECT]\n");
+
+            if (priorityMode) {
+                // 顺位模式（启动后阶段2）：proxies 写用户选的节点名（只写确实存在的），
+                // 保留主→备用1→备用2 顺位，fallback 按此顺序故障转移。
+                // 不存在的节点名跳过（不写进 proxies），避免 mihomo fatal。用户 binding 不删。
+                List<String> orderedValidNodes = new ArrayList<>();
+                for (NodeRef ref : b.nodes) {
+                    String p = realSubNameToProvider.get(ref.subscriptionName);
+                    if (p == null) continue;
+                    java.util.Set<String> real = realNodesByProvider.get(p);
+                    if (real != null && real.contains(ref.nodeName)) {
+                        orderedValidNodes.add(ref.nodeName);
+                    }
+                }
+                if (orderedValidNodes.isEmpty() && useProviders.isEmpty()) {
+                    sb.append("    proxies: [DIRECT]\n");
+                } else {
+                    // proxies: 用户顺位节点 + DIRECT 兜底
+                    sb.append("    proxies: [");
+                    for (int k = 0; k < orderedValidNodes.size(); k++) {
+                        if (k > 0) sb.append(", ");
+                        sb.append("'").append(escapeYamlSingle(orderedValidNodes.get(k))).append("'");
+                    }
+                    if (!orderedValidNodes.isEmpty()) sb.append(", ");
+                    sb.append("DIRECT]\n");
+                    if (!useProviders.isEmpty()) {
+                        sb.append("    use:\n");
+                        for (String p : useProviders) {
+                            sb.append("      - ").append(p).append("\n");
+                        }
+                    }
+                }
             } else {
-                // DIRECT 作为 fallback 最后兜底（所有 provider 节点都不可用时直连）
-                sb.append("    proxies: [DIRECT]\n");
-                sb.append("    use:\n");
-                for (String p : useProviders) {
-                    sb.append("      - ").append(p).append("\n");
+                // use-only 模式（启动阶段1）：不写用户节点名，避免 fatal
+                if (useProviders.isEmpty()) {
+                    sb.append("    proxies: [DIRECT]\n");
+                } else {
+                    sb.append("    proxies: [DIRECT]\n");
+                    sb.append("    use:\n");
+                    for (String p : useProviders) {
+                        sb.append("      - ").append(p).append("\n");
+                    }
                 }
             }
             // lazy healthcheck：只在 group 被使用（有流量）时探活，息屏无对话不探活
