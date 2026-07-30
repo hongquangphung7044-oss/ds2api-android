@@ -291,25 +291,31 @@ public final class MihomoManager {
         JSONArray bindings = config.optJSONArray("account_bindings");
         if (bindings == null) return false;
         // 备份原 bindings：恢复失败（仍 ready=false）时回滚，避免内存配置渐进式丢节点
-        JSONArray bindingsBackup = new JSONArray(bindings.toString());
+        final JSONArray bindingsBackup;
         int removed = 0;
-        for (int i = 0; i < bindings.length(); i++) {
-            JSONObject b = bindings.optJSONObject(i);
-            if (b == null) continue;
-            JSONArray nodes = b.optJSONArray("nodes");
-            if (nodes == null) continue;
-            JSONArray kept = new JSONArray();
-            for (int j = 0; j < nodes.length(); j++) {
-                JSONObject n = nodes.optJSONObject(j);
-                if (n == null) { kept.put(n); continue; }
-                String nn = n.optString("name", "");
-                if (!badNode.equals(nn)) {
-                    kept.put(n);
-                } else {
-                    removed++;
+        try {
+            bindingsBackup = new JSONArray(bindings.toString());
+            for (int i = 0; i < bindings.length(); i++) {
+                JSONObject b = bindings.optJSONObject(i);
+                if (b == null) continue;
+                JSONArray nodes = b.optJSONArray("nodes");
+                if (nodes == null) continue;
+                JSONArray kept = new JSONArray();
+                for (int j = 0; j < nodes.length(); j++) {
+                    JSONObject n = nodes.optJSONObject(j);
+                    if (n == null) { kept.put(n); continue; }
+                    String nn = n.optString("name", "");
+                    if (!badNode.equals(nn)) {
+                        kept.put(n);
+                    } else {
+                        removed++;
+                    }
                 }
+                b.put("nodes", kept);
             }
-            b.put("nodes", kept);
+        } catch (org.json.JSONException je) {
+            LogStore.get().log(TAG, "剔除节点 [" + badNode + "] 时 JSON 异常: " + je.getMessage());
+            return false;
         }
         if (removed == 0) {
             LogStore.get().log(TAG, "未在 account_bindings 找到节点 [" + badNode + "]，放弃恢复");
