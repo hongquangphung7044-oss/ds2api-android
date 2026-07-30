@@ -830,31 +830,38 @@ public final class MihomoManager {
         // - health-check lazy: true 只在 group 有流量经过时才探活（对话时探测，息屏零探活省电）
         // - interval: 600 lazy 模式下每 10 分钟最多探活一次
         // - 主节点恢复后 fallback 自动切回主节点
-        // 容错：过滤掉所属订阅下载失败的节点（否则 mihomo 因节点不存在报错导致整个 config 加载失败）；
-        //       过滤后无任何可用节点则回退 proxies: [DIRECT]
+        // 每账号一个 fallback group，用 use 引用整个 provider 节点池（不逐个写节点名）。
+        // 关键：不把用户 binding 的节点名写进 proxies，避免机场改名/下架后节点名不存在
+        // 导致 mihomo fatal 整个 config 加载失败。用户选的主节点优先级通过 applyNodeSelection
+        // 启动后调 API 切换（fallback 不支持 PUT 固定，但 fallback 按顺序自动故障转移已够用）。
+        // 失效节点：用户在 UI 测延迟时自然看到，自行更换——不自动剔除用户配置。
         sb.append("proxy-groups:\n");
+        // provider 名集合（去重），用于无 binding 账号的兜底
+        java.util.Set<String> allProviderNames = new java.util.LinkedHashSet<>();
+        for (Subscription sub : subs) {
+            allProviderNames.add(sub.providerName);
+        }
         for (AccountBinding b : bindings) {
             sb.append("  - name: ").append(b.groupName).append("\n");
             sb.append("    type: fallback\n");
-            // 只保留所属订阅在 okSubs（已下载成功）中的节点
-            List<NodeRef> validNodes = new ArrayList<>();
+            // 该账号涉及哪些订阅的 provider，就 use 哪些 provider（跨订阅混合）
+            java.util.Set<String> useProviders = new java.util.LinkedHashSet<>();
             for (NodeRef ref : b.nodes) {
-                if (subNameToProvider.containsKey(ref.subscriptionName)) {
-                    validNodes.add(ref);
-                }
+                String p = subNameToProvider.get(ref.subscriptionName);
+                if (p != null) useProviders.add(p);
             }
-            if (!validNodes.isEmpty()) {
-                // 用 proxies 明确引用用户选的节点（按优先级），跨订阅混合
-                // 节点名来自 provider，mihomo 加载 provider 后节点名全局可见
-                sb.append("    proxies: [");
-                for (int k = 0; k < validNodes.size(); k++) {
-                    if (k > 0) sb.append(", ");
-                    sb.append("'").append(escapeYamlSingle(validNodes.get(k).nodeName)).append("'");
-                }
-                sb.append("]\n");
-            } else {
-                // 无有效节点：用 DIRECT 兜底，保证配置能加载、端口能监听
+            // 兜底：账号未选任何订阅或订阅已删除，用所有 provider
+            if (useProviders.isEmpty()) useProviders.addAll(allProviderNames);
+            if (useProviders.isEmpty()) {
+                // 完全无 provider（订阅全部下载失败）：DIRECT 兜底保证端口能监听
                 sb.append("    proxies: [DIRECT]\n");
+            } else {
+                // DIRECT 作为 fallback 最后兜底（所有 provider 节点都不可用时直连）
+                sb.append("    proxies: [DIRECT]\n");
+                sb.append("    use:\n");
+                for (String p : useProviders) {
+                    sb.append("      - ").append(p).append("\n");
+                }
             }
             // lazy healthcheck：只在 group 被使用（有流量）时探活，息屏无对话不探活
             sb.append("    health-check:\n");
