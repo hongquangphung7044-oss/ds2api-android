@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>用量统计 - UI 草稿（供检查）</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap" rel="stylesheet">
+<style>
+  /* ===== 完整复刻上游 webui 的 design tokens（dark 为默认，light 可切换） ===== */
+  :root{
+    --color-background:#11151d;--color-foreground:#f3f5f7;
+    --color-card:#171c26;--color-card-foreground:#f3f5f7;
+    --color-popover:#151923;--color-popover-foreground:#f3f5f7;
+    --color-primary:#e7b008;--color-primary-foreground:#09090b;
+    --color-secondary:#242833;--color-secondary-foreground:#e7ebef;
+    --color-muted:#2b303b;--color-muted-foreground:#929baa;
+    --color-accent:#2b303b;--color-accent-foreground:#f3f5f7;
+    --color-destructive:#e14747;--color-destructive-foreground:#fafafa;
+    --color-border:#303540;--color-input:#303540;--color-ring:#e7b008;
+    --color-success:#10b77f;--color-warning:#f59f0a;--color-info:#30abe8;
+    --radius:.625rem;
+  }
+  :root[data-theme=light]{
+    --color-background:#f5f7f9;--color-foreground:#171d2b;
+    --color-card:#fff;--color-card-foreground:#171d2b;
+    --color-popover:#fff;--color-popover-foreground:#171d2b;
+    --color-primary:#f6bb09;--color-primary-foreground:#09090b;
+    --color-secondary:#e9edf1;--color-secondary-foreground:#20283c;
+    --color-muted:#e9edf1;--color-muted-foreground:#606876;
+    --color-accent:#f6f2e4;--color-accent-foreground:#654f0b;
+    --color-destructive:#d62929;--color-destructive-foreground:#fff;
+    --color-border:#dbdfe6;--color-input:#dbdfe6;--color-ring:#f6bb09;
+  }
+  *{box-sizing:border-box;border-color:var(--color-border)}
+  html{color-scheme:dark}
+  html[data-theme=light]{color-scheme:light}
+  body{
+    background:radial-gradient(60rem 30rem at 85% -10%, #e7b0081a, transparent 60%), radial-gradient(50rem 26rem at -10% 110%, #2e406b59, transparent 60%), var(--color-background);
+    color:var(--color-foreground);margin:0;font-family:Inter,ui-sans-serif,system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;min-height:100vh;
+  }
+  :root[data-theme=light] body{background:radial-gradient(60rem 30rem at 85% -10%, #f6bb0914, transparent 60%), radial-gradient(50rem 26rem at -10% 110%, #adc9eb80, transparent 60%), var(--color-background)}
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-track{background:0 0}
+  ::-webkit-scrollbar-thumb{background:#434956b3;border-radius:999px}
+  .card{background-color:var(--color-card);color:var(--color-card-foreground);border:1px solid var(--color-border);border-radius:calc(var(--radius) + .125rem);overflow:hidden;box-shadow:0 1px 2px #0000000f}
+  .btn{border-radius:var(--radius);justify-content:center;align-items:center;gap:.375rem;padding:.5rem 1rem;font-size:.875rem;font-weight:500;line-height:1.25rem;transition:background-color .15s,color .15s,border-color .15s,box-shadow .15s,transform 50ms,filter .15s;display:inline-flex;cursor:pointer;border:0}
+  .btn-primary{background-color:var(--color-primary);color:var(--color-primary-foreground);box-shadow:0 1px 2px #00000014}
+  .btn-primary:hover{filter:brightness(1.06)}
+  .btn-secondary{background-color:var(--color-secondary);color:var(--color-secondary-foreground);border:1px solid var(--color-border)}
+  .btn-secondary:hover{background-color:var(--color-accent);color:var(--color-accent-foreground)}
+  .btn-sm{padding:.375rem .75rem;font-size:.75rem}
+  .input-field{border-radius:var(--radius);border:1px solid var(--color-input);background-color:var(--color-background);width:100%;height:2.5rem;color:var(--color-foreground);padding:.5rem .75rem;font-size:.875rem;display:flex}
+  .text-muted-foreground{color:var(--color-muted-foreground)}
+  .text-primary{color:var(--color-primary)}
+  .text-foreground{color:var(--color-foreground)}
+  .bg-muted{background-color:var(--color-muted)}
+  .bg-primary\/10{background-color:color-mix(in srgb, var(--color-primary) 10%, transparent)}
+  .bg-emerald-500\/10{background-color:#10b9811a}
+  .bg-blue-500\/10{background-color:#3b82f61a}
+  .bg-orange-500\/10{background-color:#f973161a}
+  .bg-purple-500\/10{background-color:#a855f71a}
+  .text-emerald-500{color:#10b981}
+  .text-blue-500{color:#3b82f6}
+  .text-orange-500{color:#f97316}
+  .text-purple-500{color:#a855f7}
+  .rounded-md{border-radius:calc(var(--radius) - 2px)}
+  .rounded-lg{border-radius:var(--radius)}
+  .rounded-full{border-radius:9999px}
+
+  /* ===== 布局 ===== */
+  .app{display:grid;grid-template-columns:260px 1fr;min-height:100vh}
+  @media(max-width:1024px){.app{grid-template-columns:1fr}.sidebar{display:none}}
+
+  /* 侧边栏 — 复刻上游结构，新增"用量统计"高亮 */
+  .sidebar{background-color:var(--color-card);border-right:1px solid var(--color-border);padding:1rem;display:flex;flex-direction:column;gap:.25rem;position:sticky;top:0;height:100vh;overflow-y:auto}
+  .brand{display:flex;align-items:center;gap:.625rem;padding:.75rem .5rem 1.25rem}
+  .brand-logo{width:2rem;height:2rem;border-radius:.5rem;background:linear-gradient(135deg,var(--color-primary),#f59e0b);display:flex;align-items:center;justify-content:center;color:var(--color-primary-foreground);font-weight:700;font-size:.875rem}
+  .brand-title{font-size:.95rem;font-weight:600;letter-spacing:-.01em}
+  .brand-sub{font-size:.7rem;color:var(--color-muted-foreground);margin-top:.125rem}
+  .nav-section{font-size:.7rem;color:var(--color-muted-foreground);padding:.5rem .75rem .25rem;letter-spacing:.08em;text-transform:uppercase}
+  .nav-item{display:flex;align-items:center;gap:.75rem;padding:.5rem .75rem;border-radius:var(--radius);color:var(--color-muted-foreground);font-size:.875rem;cursor:pointer;transition:background-color .15s,color .15s;text-decoration:none}
+  .nav-item:hover{background-color:var(--color-muted);color:var(--color-foreground)}
+  .nav-item.active{background-color:var(--color-primary);color:var(--color-primary-foreground)}
+  .nav-item svg{width:1.125rem;height:1.125rem;flex-shrink:0}
+  .nav-item.new::after{content:"新";font-size:.625rem;background:var(--color-success);color:#fff;padding:.0625rem .3125rem;border-radius:9999px;margin-left:auto;font-weight:600}
+
+  /* 主内容区 */
+  .main{padding:1.5rem;max-width:1400px}
+  .page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap}
+  .page-title{font-size:1.5rem;font-weight:600;letter-spacing:-.02em;margin:0}
+  .page-desc{font-size:.8125rem;color:var(--color-muted-foreground);margin-top:.25rem}
+  .toolbar{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+
+  /* 统计卡 */
+  .stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:1.5rem}
+  @media(max-width:900px){.stats-grid{grid-template-columns:repeat(2,1fr)}}
+  @media(max-width:520px){.stats-grid{grid-template-columns:1fr}}
+  .stat-card{padding:1.25rem;display:flex;flex-direction:column;gap:.5rem}
+  .stat-label{display:flex;align-items:center;gap:.5rem;font-size:.75rem;color:var(--color-muted-foreground);font-weight:500}
+  .stat-icon{width:1.75rem;height:1.75rem;border-radius:.5rem;display:flex;align-items:center;justify-content:center}
+  .stat-value{font-size:1.75rem;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+  .stat-delta{font-size:.75rem;display:flex;align-items:center;gap:.25rem}
+  .stat-delta.up{color:var(--color-success)}
+  .stat-delta.down{color:var(--color-destructive)}
+  .stat-sub{font-size:.7rem;color:var(--color-muted-foreground)}
+
+  /* 趋势图卡 */
+  .chart-card{padding:1.25rem;margin-bottom:1.5rem}
+  .chart-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;flex-wrap:wrap;gap:.5rem}
+  .chart-title{font-size:.95rem;font-weight:600}
+  .chart-legend{display:flex;gap:1rem;font-size:.75rem;color:var(--color-muted-foreground)}
+  .chart-legend span{display:flex;align-items:center;gap:.3125rem}
+  .chart-legend i{width:.625rem;height:.625rem;border-radius:9999px;display:inline-block}
+  .chart{height:200px;display:flex;align-items:flex-end;gap:3px;padding-top:.5rem;position:relative}
+  .chart-bar{flex:1;background:linear-gradient(to top, var(--color-primary), color-mix(in srgb, var(--color-primary) 40%, transparent));border-radius:3px 3px 0 0;min-height:4px;position:relative;transition:opacity .15s}
+  .chart-bar:hover{opacity:.8}
+  .chart-bar.alt{background:linear-gradient(to top, #3b82f6, #3b82f640)}
+  .chart-x{display:flex;justify-content:space-between;font-size:.625rem;color:var(--color-muted-foreground);margin-top:.5rem}
+
+  /* 模型用量表 */
+  .model-card{padding:0;margin-bottom:1.5rem}
+  .model-header{padding:1rem 1.25rem;border-bottom:1px solid var(--color-border);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem}
+  .model-title{font-size:.95rem;font-weight:600}
+  .table-wrap{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:.8125rem}
+  thead th{text-align:left;padding:.75rem 1.25rem;font-size:.7rem;font-weight:600;color:var(--color-muted-foreground);letter-spacing:.05em;text-transform:uppercase;border-bottom:1px solid var(--color-border);white-space:nowrap}
+  tbody td{padding:.875rem 1.25rem;border-bottom:1px solid var(--color-border)}
+  tbody tr:last-child td{border-bottom:0}
+  tbody tr:hover{background-color:var(--color-muted)}
+  .model-name{display:flex;align-items:center;gap:.5rem;font-weight:500}
+  .model-dot{width:.5rem;height:.5rem;border-radius:9999px;flex-shrink:0}
+  .num{font-variant-numeric:tabular-nums}
+  .bar-cell{width:160px}
+  .mini-bar{height:6px;background:var(--color-muted);border-radius:9999px;overflow:hidden}
+  .mini-bar-fill{height:100%;background:var(--color-primary);border-radius:9999px}
+
+  /* 账号用量表 */
+  .empty-note{padding:1.25rem;font-size:.8125rem;color:var(--color-muted-foreground);text-align:center}
+
+  /* 切换主题按钮（仅预览用） */
+  .theme-toggle{position:fixed;bottom:1rem;right:1rem;z-index:50}
+
+  .badge{display:inline-flex;align-items:center;gap:.25rem;font-size:.625rem;padding:.125rem .5rem;border-radius:9999px;font-weight:600}
+  .badge-info{background:var(--color-info);color:#fff}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <!-- 侧边栏（展示"用量统计"已插入到账号管理上方） -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-logo">DS</div>
+      <div>
+        <div class="brand-title">DS2API</div>
+        <div class="brand-sub">管理面板</div>
+      </div>
+    </div>
+    <div class="nav-section">主要功能</div>
+    <a class="nav-item new active" href="#">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-5"/></svg>
+      用量统计
+    </a>
+    <a class="nav-item" href="#">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/></svg>
+      账号管理
+    </a>
+    <a class="nav-item" href="#">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/></svg>
+      代理 IP
+    </a>
+    <a class="nav-item" href="#">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/></svg>
+      API 测试
+    </a>
+    <a class="nav-item" href="#">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M19 9l-5 5-4-4-3 3"/></svg>
+      响应记录
+    </a>
+    <div class="nav-section">高级</div>
+    <a class="nav-item" href="#">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+      批量导入
+    </a>
+    <a class="nav-item" href="#">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>
+      Vercel 同步
+    </a>
+    <a class="nav-item" href="#">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      设置中心
+    </a>
+  </aside>
+
+  <!-- 主内容 -->
+  <main class="main">
+    <div class="page-header">
+      <div>
+        <h1 class="page-title">用量统计</h1>
+        <div class="page-desc">今日 token 用量、累计总量、按模型与账号拆分（数据来自聊天历史的 usage 字段）</div>
+      </div>
+      <div class="toolbar">
+        <select class="input-field" style="width:auto;height:2.25rem">
+          <option>最近 7 天</option>
+          <option>今日</option>
+          <option>最近 30 天</option>
+          <option>全部</option>
+        </select>
+        <button class="btn btn-secondary btn-sm">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          刷新
+        </button>
+        <button class="btn btn-primary btn-sm">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          导出 CSV
+        </button>
+      </div>
+    </div>
+
+    <!-- 概览卡片：今日/总量/请求数/活跃账号 -->
+    <div class="stats-grid">
+      <div class="card stat-card">
+        <div class="stat-label">
+          <div class="stat-icon bg-primary/10"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--color-primary)" stroke-width="2"><path d="M12 2v20M2 12h20"/></svg></div>
+          今日 Token 用量
+        </div>
+        <div class="stat-value text-primary">1,284,506</div>
+        <div class="stat-delta up">↑ 12.3% 较昨日</div>
+        <div class="stat-sub">输入 812,340 · 输出 472,166</div>
+      </div>
+      <div class="card stat-card">
+        <div class="stat-label">
+          <div class="stat-icon bg-blue-500/10"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div>
+          累计 Token 总量
+        </div>
+        <div class="stat-value">48,392,107</div>
+        <div class="stat-delta up">↑ 本周新增 6.2M</div>
+        <div class="stat-sub">自 2026-07-01 起统计</div>
+      </div>
+      <div class="card stat-card">
+        <div class="stat-label">
+          <div class="stat-icon bg-emerald-500/10"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></div>
+          今日请求数
+        </div>
+        <div class="stat-value text-emerald-500">342</div>
+        <div class="stat-delta up">↑ 28 较昨日</div>
+        <div class="stat-sub">成功 331 · 失败 11 · 流式 298</div>
+      </div>
+      <div class="card stat-card">
+        <div class="stat-label">
+          <div class="stat-icon bg-purple-500/10"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#a855f7" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div>
+          活跃账号
+        </div>
+        <div class="stat-value text-purple-500">6 / 9</div>
+        <div class="stat-delta">—</div>
+        <div class="stat-sub">3 个账号今日无请求</div>
+      </div>
+    </div>
+
+    <!-- 7 日趋势图 -->
+    <div class="card chart-card">
+      <div class="chart-header">
+        <div>
+          <div class="chart-title">7 日 Token 用量趋势</div>
+          <div class="page-desc" style="margin-top:.125rem">按天聚合，柱状图展示输入/输出 token 分布</div>
+        </div>
+        <div class="chart-legend">
+          <span><i style="background:var(--color-primary)"></i>输入 tokens</span>
+          <span><i style="background:#3b82f6"></i>输出 tokens</span>
+        </div>
+      </div>
+      <div class="chart">
+        <!-- 7 根柱（每根两层：输入在下、输出在上），高度按模拟数据 -->
+        <div class="chart-bar" style="height:45%" title="07-24 输入 620k"></div>
+        <div class="chart-bar" style="height:52%" title="07-25 输入 720k"></div>
+        <div class="chart-bar" style="height:38%" title="07-26 输入 530k"></div>
+        <div class="chart-bar" style="height:61%" title="07-27 输入 845k"></div>
+        <div class="chart-bar" style="height:48%" title="07-28 输入 668k"></div>
+        <div class="chart-bar" style="height:55%" title="07-29 输入 760k"></div>
+        <div class="chart-bar" style="height:68%;background:linear-gradient(to top, var(--color-primary), color-mix(in srgb, var(--color-primary) 40%, transparent))" title="今日 输入 812k"></div>
+      </div>
+      <div class="chart-x">
+        <span>07-24</span><span>07-25</span><span>07-26</span><span>07-27</span><span>07-28</span><span>07-29</span><span>今日</span>
+      </div>
+    </div>
+
+    <!-- 模型维度用量表 -->
+    <div class="card model-card">
+      <div class="model-header">
+        <div>
+          <div class="model-title">按模型统计</div>
+          <div class="page-desc" style="margin-top:.125rem">各模型 token 消耗占比与请求数</div>
+        </div>
+        <span class="badge badge-info">所选时间范围内</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>模型</th>
+              <th>请求数</th>
+              <th>输入 tokens</th>
+              <th>输出 tokens</th>
+              <th>总 tokens</th>
+              <th>占比</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><div class="model-name"><span class="model-dot" style="background:var(--color-primary)"></span>deepseek-chat</div></td>
+              <td class="num">218</td>
+              <td class="num">524,180</td>
+              <td class="num">298,440</td>
+              <td class="num text-primary" style="font-weight:600">822,620</td>
+              <td class="bar-cell"><div class="mini-bar"><div class="mini-bar-fill" style="width:64%"></div></div></td>
+            </tr>
+            <tr>
+              <td><div class="model-name"><span class="model-dot" style="background:#3b82f6"></span>deepseek-reasoner</div></td>
+              <td class="num">98</td>
+              <td class="num">241,160</td>
+              <td class="num">156,726</td>
+              <td class="num text-primary" style="font-weight:600">397,886</td>
+              <td class="bar-cell"><div class="mini-bar"><div class="mini-bar-fill" style="width:31%;background:#3b82f6"></div></div></td>
+            </tr>
+            <tr>
+              <td><div class="model-name"><span class="model-dot" style="background:#10b981"></span>deepseek-vision</div></td>
+              <td class="num">26</td>
+              <td class="num">47,000</td>
+              <td class="num">17,000</td>
+              <td class="num text-primary" style="font-weight:600">64,000</td>
+              <td class="bar-cell"><div class="mini-bar"><div class="mini-bar-fill" style="width:5%;background:#10b981"></div></div></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 账号维度用量表 -->
+    <div class="card model-card">
+      <div class="model-header">
+        <div>
+          <div class="model-title">按账号统计</div>
+          <div class="page-desc" style="margin-top:.125rem">各 DeepSeek 账号的 token 消耗与请求分布</div>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>账号</th>
+              <th>代理出口</th>
+              <th>请求数</th>
+              <th>总 tokens</th>
+              <th>占比</th>
+              <th>状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>3320161196139@stu.xhu.edu.cn</td>
+              <td class="text-muted-foreground">台湾省₄</td>
+              <td class="num">87</td>
+              <td class="num text-primary" style="font-weight:600">312,440</td>
+              <td class="bar-cell"><div class="mini-bar"><div class="mini-bar-fill" style="width:24%"></div></div></td>
+              <td><span class="badge" style="background:var(--color-success);color:#fff">活跃</span></td>
+            </tr>
+            <tr>
+              <td>1018084600@stu.xhu.edu.cn</td>
+              <td class="text-muted-foreground">台湾省₃</td>
+              <td class="num">72</td>
+              <td class="num text-primary" style="font-weight:600">268,109</td>
+              <td class="bar-cell"><div class="mini-bar"><div class="mini-bar-fill" style="width:21%"></div></div></td>
+              <td><span class="badge" style="background:var(--color-success);color:#fff">活跃</span></td>
+            </tr>
+            <tr>
+              <td>31415926535@stu.xhu.edu.cn</td>
+              <td class="text-muted-foreground">台湾省</td>
+              <td class="num">65</td>
+              <td class="num text-primary" style="font-weight:600">241,887</td>
+              <td class="bar-cell"><div class="mini-bar"><div class="mini-bar-fill" style="width:19%"></div></div></td>
+              <td><span class="badge" style="background:var(--color-success);color:#fff">活跃</span></td>
+            </tr>
+            <tr>
+              <td>7354898018@stu.xhu.edu.cn</td>
+              <td class="text-muted-foreground">台湾省₂</td>
+              <td class="num">58</td>
+              <td class="num text-primary" style="font-weight:600">198,302</td>
+              <td class="bar-cell"><div class="mini-bar"><div class="mini-bar-fill" style="width:15%"></div></div></td>
+              <td><span class="badge" style="background:var(--color-warning);color:#fff">封号自动禁用</span></td>
+            </tr>
+            <tr>
+              <td>31415@stu.xhu.edu.cn</td>
+              <td class="text-muted-foreground">台湾省₂</td>
+              <td class="num">0</td>
+              <td class="num text-muted-foreground">0</td>
+              <td class="bar-cell"><div class="mini-bar"><div class="mini-bar-fill" style="width:0%"></div></div></td>
+              <td><span class="badge" style="background:var(--color-muted-foreground);color:#fff">今日无请求</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" style="padding:1rem 1.25rem;margin-top:1rem">
+      <div style="display:flex;align-items:flex-start;gap:.625rem;font-size:.8125rem;color:var(--color-muted-foreground)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;margin-top:1px"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+        <div>
+          <strong style="color:var(--color-foreground)">说明</strong>：用量数据基于聊天历史（chat-history）的 <code style="background:var(--color-muted);padding:.0625rem .3125rem;border-radius:.25rem;font-size:.75rem">usage</code> 字段聚合。
+          仅统计请求成功（status=success）的记录；流式与非流式均包含；历史保留策略外的记录无法统计（可在"响应记录"页调整保留条数）。
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<button class="btn btn-secondary btn-sm theme-toggle" onclick="toggleTheme()">
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+  切换主题
+</button>
+
+<script>
+  function toggleTheme(){
+    const html=document.documentElement;
+    html.setAttribute('data-theme', html.getAttribute('data-theme')==='light'?'dark':'light');
+  }
+</script>
+</body>
+</html>
