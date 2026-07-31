@@ -1,0 +1,1088 @@
+From 513e42c081f144a40e3c2e435e25c06f69ea5198 Mon Sep 17 00:00:00 2001
+From: patch <patch@local>
+Date: Fri, 31 Jul 2026 12:49:18 +0000
+Subject: [PATCH] feat: add usage statistics (token usage tracking + webui
+ page)
+
+---
+ internal/chathistory/store.go                 |   4 +
+ internal/httpapi/admin/handler.go             |   5 +
+ internal/httpapi/admin/usage/deps.go          |   3 +
+ internal/httpapi/admin/usage/handler_usage.go |  37 ++
+ internal/httpapi/admin/usage/routes.go        |   8 +
+ internal/server/router.go                     |   8 +-
+ internal/usagestats/usagestats.go             | 358 +++++++++++++++++
+ .../usage/UsageStatisticsContainer.jsx        | 378 ++++++++++++++++++
+ webui/src/layout/DashboardShell.jsx           |   5 +
+ webui/src/locales/en.json                     |  38 ++
+ webui/src/locales/zh.json                     |  38 ++
+ 11 files changed, 881 insertions(+), 1 deletion(-)
+ create mode 100644 internal/httpapi/admin/usage/deps.go
+ create mode 100644 internal/httpapi/admin/usage/handler_usage.go
+ create mode 100644 internal/httpapi/admin/usage/routes.go
+ create mode 100644 internal/usagestats/usagestats.go
+ create mode 100644 webui/src/features/usage/UsageStatisticsContainer.jsx
+
+diff --git a/internal/chathistory/store.go b/internal/chathistory/store.go
+index 85228dc..239f13d 100644
+--- a/internal/chathistory/store.go
++++ b/internal/chathistory/store.go
+@@ -14,6 +14,7 @@ import (
+ 	"github.com/google/uuid"
+ 
+ 	"ds2api/internal/config"
++	"ds2api/internal/usagestats"
+ 	"ds2api/internal/util"
+ )
+ 
+@@ -326,6 +327,9 @@ func (s *Store) Update(id string, params UpdateParams) (Entry, error) {
+ 	item.FinishReason = strings.TrimSpace(params.FinishReason)
+ 	if params.Usage != nil {
+ 		item.Usage = cloneMap(params.Usage)
++		// 独立统计存储：每次 usage 写入时同步累加（不依赖环形缓冲，长期保留）。
++		// usagestats.Stats 是全局单例，nil 时 Record 静默返回，不影响主链路。
++		usagestats.Stats.Record(item.Model, item.AccountID, item.UpdatedAt, params.Usage, item.Stream)
+ 	}
+ 	if params.Completed {
+ 		item.CompletedAt = now
+diff --git a/internal/httpapi/admin/handler.go b/internal/httpapi/admin/handler.go
+index 236991b..2cc780a 100644
+--- a/internal/httpapi/admin/handler.go
++++ b/internal/httpapi/admin/handler.go
+@@ -6,6 +6,7 @@ import (
+ 	"github.com/go-chi/chi/v5"
+ 
+ 	"ds2api/internal/chathistory"
++	"ds2api/internal/usagestats"
+ 	adminaccounts "ds2api/internal/httpapi/admin/accounts"
+ 	adminauth "ds2api/internal/httpapi/admin/auth"
+ 	adminconfig "ds2api/internal/httpapi/admin/configmgmt"
+@@ -15,6 +16,7 @@ import (
+ 	adminrawsamples "ds2api/internal/httpapi/admin/rawsamples"
+ 	adminsettings "ds2api/internal/httpapi/admin/settings"
+ 	adminshared "ds2api/internal/httpapi/admin/shared"
++	adminusage "ds2api/internal/httpapi/admin/usage"
+ 	adminvercel "ds2api/internal/httpapi/admin/vercel"
+ 	adminversion "ds2api/internal/httpapi/admin/version"
+ )
+@@ -25,6 +27,7 @@ type Handler struct {
+ 	DS          adminshared.DeepSeekCaller
+ 	OpenAI      adminshared.OpenAIChatCaller
+ 	ChatHistory *chathistory.Store
++	UsageStats  *usagestats.Store
+ 	// WebUIFallback is forwarded to the auth sub-handler so its RequireAdmin
+ 	// middleware can serve the SPA index.html when a browser navigation request
+ 	// (GET, no Authorization, Accept: text/html) hits a protected admin API
+@@ -44,6 +47,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
+ 	historyHandler := &adminhistory.Handler{Store: deps.Store, Pool: deps.Pool, DS: deps.DS, OpenAI: deps.OpenAI, ChatHistory: deps.ChatHistory}
+ 	devCaptureHandler := &admindevcapture.Handler{Store: deps.Store, Pool: deps.Pool, DS: deps.DS, OpenAI: deps.OpenAI, ChatHistory: deps.ChatHistory}
+ 	versionHandler := &adminversion.Handler{Store: deps.Store, Pool: deps.Pool, DS: deps.DS, OpenAI: deps.OpenAI, ChatHistory: deps.ChatHistory}
++	usageHandler := &adminusage.Handler{Stats: h.UsageStats}
+ 
+ 	adminauth.RegisterPublicRoutes(r, authHandler)
+ 	r.Group(func(pr chi.Router) {
+@@ -58,6 +62,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
+ 		admindevcapture.RegisterRoutes(pr, devCaptureHandler)
+ 		adminhistory.RegisterRoutes(pr, historyHandler)
+ 		adminversion.RegisterRoutes(pr, versionHandler)
++		adminusage.RegisterRoutes(pr, usageHandler)
+ 	})
+ }
+ 
+diff --git a/internal/httpapi/admin/usage/deps.go b/internal/httpapi/admin/usage/deps.go
+new file mode 100644
+index 0000000..a4f49a8
+--- /dev/null
++++ b/internal/httpapi/admin/usage/deps.go
+@@ -0,0 +1,3 @@
++package usage
++
++// deps.go 占位，保持与其他 admin 子模块结构一致。
+diff --git a/internal/httpapi/admin/usage/handler_usage.go b/internal/httpapi/admin/usage/handler_usage.go
+new file mode 100644
+index 0000000..a4e9c27
+--- /dev/null
++++ b/internal/httpapi/admin/usage/handler_usage.go
+@@ -0,0 +1,37 @@
++package usage
++
++import (
++	"net/http"
++	"strconv"
++
++	"ds2api/internal/usagestats"
++	adminshared "ds2api/internal/httpapi/admin/shared"
++)
++
++// Handler 处理 /admin/usage 相关请求。
++type Handler struct {
++	Stats *usagestats.Store
++}
++
++var writeJSON = adminshared.WriteJSON
++
++// getUsage GET /admin/usage?range_days=7
++// range_days=0 表示全部，默认 7。
++func (h *Handler) getUsage(w http.ResponseWriter, r *http.Request) {
++	if h == nil || h.Stats == nil {
++		writeJSON(w, http.StatusOK, usagestats.Summary{
++			ByModel:   []usagestats.ModelSummary{},
++			ByAccount: []usagestats.ModelSummary{},
++			Last7Days: []usagestats.DaySummary{},
++		})
++		return
++	}
++	rangeDays := 7
++	if v := r.URL.Query().Get("range_days"); v != "" {
++		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
++			rangeDays = n
++		}
++	}
++	summary := h.Stats.Summary(rangeDays)
++	writeJSON(w, http.StatusOK, summary)
++}
+diff --git a/internal/httpapi/admin/usage/routes.go b/internal/httpapi/admin/usage/routes.go
+new file mode 100644
+index 0000000..c588812
+--- /dev/null
++++ b/internal/httpapi/admin/usage/routes.go
+@@ -0,0 +1,8 @@
++package usage
++
++import "github.com/go-chi/chi/v5"
++
++// RegisterRoutes 注册 usage 统计相关路由。
++func RegisterRoutes(r chi.Router, h *Handler) {
++	r.Get("/usage", h.getUsage)
++}
+diff --git a/internal/server/router.go b/internal/server/router.go
+index f7b8647..28c4c56 100644
+--- a/internal/server/router.go
++++ b/internal/server/router.go
+@@ -30,6 +30,7 @@ import (
+ 	"ds2api/internal/httpapi/openai/responses"
+ 	"ds2api/internal/httpapi/openai/shared"
+ 	"ds2api/internal/httpapi/requestbody"
++	"ds2api/internal/usagestats"
+ 	"ds2api/internal/webui"
+ )
+ 
+@@ -62,6 +63,11 @@ func NewApp() (*App, error) {
+ 		config.Logger.Warn("[chat_history] unavailable", "path", chatHistoryStore.Path(), "error", err)
+ 	}
+ 
++	// 初始化 usage 统计存储单例（覆盖 usagestats 包级默认实例）。
++	// chathistory.Store.Update 的 hook 通过 usagestats.Stats 全局变量访问。
++	usageStatsStore := usagestats.New(usagestats.DefaultPath())
++	usagestats.Stats = usageStatsStore
++
+ 	contentStore := files.NewMemoryContentStore(100<<20, 30*time.Minute)
+ 
+ 	modelsHandler := &shared.ModelsHandler{Store: store}
+@@ -73,7 +79,7 @@ func NewApp() (*App, error) {
+ 	geminiHandler := &gemini.Handler{Store: store, Auth: resolver, DS: dsClient, OpenAI: chatHandler, ChatHistory: chatHistoryStore}
+ 	ollamaHandler := &ollama.Handler{Store: store}
+ 	webuiHandler := webui.NewHandler()
+-	adminHandler := &admin.Handler{Store: store, Pool: pool, DS: dsClient, OpenAI: chatHandler, ChatHistory: chatHistoryStore, WebUIFallback: webuiHandler.HandleAdminFallback}
++	adminHandler := &admin.Handler{Store: store, Pool: pool, DS: dsClient, OpenAI: chatHandler, ChatHistory: chatHistoryStore, UsageStats: usageStatsStore, WebUIFallback: webuiHandler.HandleAdminFallback}
+ 
+ 	r := chi.NewRouter()
+ 	r.Use(middleware.RequestID)
+diff --git a/internal/usagestats/usagestats.go b/internal/usagestats/usagestats.go
+new file mode 100644
+index 0000000..c406f7c
+--- /dev/null
++++ b/internal/usagestats/usagestats.go
+@@ -0,0 +1,358 @@
++// Package usagestats 提供独立于 chat-history 的 token 用量统计存储。
++//
++// 设计目标：
++//   - 不依赖 chathistory 的有界环形缓冲（默认 20 条、上限 50 条，超出物理删除）
++//   - 每次对话成功后由 chathistory.Store.Update 的 hook 调用 Record 累加
++//   - 持久化到 data/usage_stats.json，长期累积、不丢失
++//   - 按 日期 → 模型 → 账号 三维聚合，支持今日/累计/7日趋势/按模型/按账号 查询
++//
++// usage map 的 key 由不同 surface 产生，本模块统一归一化：
++//   - openai-chat:    prompt_tokens / completion_tokens / total_tokens
++//   - openai-responses: input_tokens / output_tokens / total_tokens
++//   - claude/generic: input_tokens / output_tokens / reasoning_tokens / total_tokens
++// 归一化后统一用 input_tokens / output_tokens / total_tokens（reasoning 已含在 output 内）。
++package usagestats
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"sort"
++	"sync"
++	"time"
++)
++
++// Stats 存储 usage 统计的全局单例。在 router.go 初始化时设置。
++var Stats = New(resolveDataDir())
++
++// Record 代表单次请求的归一化 usage（内部用，不导出）。
++
++// dailyKey 形如 "2026-07-30"（UTC），用于按日聚合。
++func dailyKey(ts int64) string {
++	return time.UnixMilli(ts).UTC().Format("2006-01-02")
++}
++
++// modelDayAgg 是某模型在某日的聚合值。
++type modelDayAgg struct {
++	Input  int `json:"input_tokens"`
++	Output int `json:"output_tokens"`
++	Total  int `json:"total_tokens"`
++	Count  int `json:"request_count"`
++}
++
++// accountDayAgg 是某账号在某日的聚合值。
++type accountDayAgg struct {
++	Input  int `json:"input_tokens"`
++	Output int `json:"output_tokens"`
++	Total  int `json:"total_tokens"`
++	Count  int `json:"request_count"`
++}
++
++// dayAgg 是某日的总聚合（跨所有模型/账号）。
++type dayAgg struct {
++	Input     int                      `json:"input_tokens"`
++	Output    int                      `json:"output_tokens"`
++	Total     int                      `json:"total_tokens"`
++	Count     int                      `json:"request_count"`
++	Stream    int                      `json:"stream_count"`
++	ByModel   map[string]modelDayAgg   `json:"by_model"`
++	ByAccount map[string]accountDayAgg `json:"by_account"`
++}
++
++// fileStore 是持久化到磁盘的统计文件结构。
++type fileStore struct {
++	Version int                `json:"version"`
++	Days    map[string]*dayAgg `json:"days"` // key = "2026-07-30"
++}
++
++// Store 是 usage 统计存储。
++type Store struct {
++	mu   sync.Mutex
++	path string
++	data *fileStore
++}
++
++// New 创建并加载统计存储。
++func New(path string) *Store {
++	s := &Store{path: path, data: &fileStore{Version: 1, Days: make(map[string]*dayAgg)}}
++	s.load()
++	return s
++}
++
++// Path 返回存储文件路径。
++func (s *Store) Path() string {
++	if s == nil {
++		return ""
++	}
++	return s.path
++}
++
++func resolveDataDir() string {
++	return DefaultPath()
++}
++
++// DefaultPath 返回统计文件的默认路径。
++// 优先级：DS2API_USAGE_STATS_PATH > Vercel /tmp > chathistory 同目录 > data/usage_stats.json
++func DefaultPath() string {
++	if v := os.Getenv("DS2API_USAGE_STATS_PATH"); v != "" {
++		return v
++	}
++	// Vercel 只能写 /tmp
++	if os.Getenv("VERCEL") != "" || os.Getenv("NOW_REGION") != "" {
++		return "/tmp/usage_stats.json"
++	}
++	// 与 chathistory 同目录（data/），便于备份管理
++	if v := os.Getenv("DS2API_CHAT_HISTORY_PATH"); v != "" {
++		return filepath.Join(filepath.Dir(v), "usage_stats.json")
++	}
++	return "data/usage_stats.json"
++}
++
++// load 从磁盘加载统计文件。文件不存在或损坏时静默初始化空存储（不阻断服务）。
++func (s *Store) load() {
++	if s == nil || s.path == "" {
++		return
++	}
++	b, err := os.ReadFile(s.path)
++	if err != nil {
++		return // 文件不存在是正常情况（首次运行）
++	}
++	var fs fileStore
++	if err := json.Unmarshal(b, &fs); err != nil {
++		return // 损坏则忽略，用空存储
++	}
++	if fs.Days == nil {
++		fs.Days = make(map[string]*dayAgg)
++	}
++	s.data = &fs
++}
++
++// save 原子写盘。写失败不 panic（统计是 best-effort，不阻断请求链路）。
++func (s *Store) save() {
++	if s == nil || s.path == "" {
++		return
++	}
++	if err := os.MkdirAll(filepath.Dir(s.path), 0755); err != nil {
++		return
++	}
++	b, err := json.MarshalIndent(s.data, "", "  ")
++	if err != nil {
++		return
++	}
++	tmp := s.path + ".tmp"
++	if err := os.WriteFile(tmp, b, 0644); err != nil {
++		return
++	}
++	_ = os.Rename(tmp, s.path)
++}
++
++// NormalizeUsage 把不同 surface 的 usage map 归一化为 input/output/total。
++// 优先级：total_tokens 字段 > input+output 计算。
++func NormalizeUsage(usage map[string]any) (input, output, total int) {
++	if usage == nil {
++		return 0, 0, 0
++	}
++	input = toInt(usage["prompt_tokens"]) + toInt(usage["input_tokens"])
++	output = toInt(usage["completion_tokens"]) + toInt(usage["output_tokens"])
++	total = toInt(usage["total_tokens"])
++	if total == 0 && (input > 0 || output > 0) {
++		total = input + output
++	}
++	return input, output, total
++}
++
++func toInt(v any) int {
++	switch n := v.(type) {
++	case int:
++		return n
++	case int64:
++		return int(n)
++	case float64:
++		return int(n)
++	case json.Number:
++		i, _ := n.Int64()
++		return int(i)
++	default:
++		return 0
++	}
++}
++
++// Record 累加一次请求的 usage。线程安全。
++// 由 chathistory.Store.Update 在 params.Usage != nil 时调用。
++// model/accountID 为空时归为 "unknown"。total==0 的空 usage 不记录。
++func (s *Store) Record(model, accountID string, ts int64, usage map[string]any, stream bool) {
++	if s == nil {
++		return
++	}
++	input, output, total := NormalizeUsage(usage)
++	if total == 0 {
++		return // 空 usage 不记录
++	}
++	if model == "" {
++		model = "unknown"
++	}
++	if accountID == "" {
++		accountID = "unknown"
++	}
++	key := dailyKey(ts)
++
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	day, ok := s.data.Days[key]
++	if !ok {
++		day = &dayAgg{ByModel: make(map[string]modelDayAgg), ByAccount: make(map[string]accountDayAgg)}
++		s.data.Days[key] = day
++	}
++	day.Input += input
++	day.Output += output
++	day.Total += total
++	day.Count++
++	if stream {
++		day.Stream++
++	}
++
++	m := day.ByModel[model]
++	m.Input += input
++	m.Output += output
++	m.Total += total
++	m.Count++
++	day.ByModel[model] = m
++
++	a := day.ByAccount[accountID]
++	a.Input += input
++	a.Output += output
++	a.Total += total
++	a.Count++
++	day.ByAccount[accountID] = a
++
++	s.save()
++}
++
++// Summary 是 /admin/usage 返回的聚合结果。
++type Summary struct {
++	Today      string         `json:"today"`       // 今日日期 key（UTC）
++	TodayStats DaySummary     `json:"today_stats"` // 今日汇总
++	TotalStats DaySummary     `json:"total_stats"` // 全部累计
++	Last7Days  []DaySummary   `json:"last_7_days"` // 最近 7 天（含今日，按日期升序）
++	ByModel    []ModelSummary `json:"by_model"`    // 按模型汇总（所选范围）
++	ByAccount  []ModelSummary `json:"by_account"`  // 按账号汇总（所选范围）
++}
++
++// DaySummary 是某日的聚合展示。
++type DaySummary struct {
++	Date   string `json:"date"`
++	Input  int    `json:"input_tokens"`
++	Output int    `json:"output_tokens"`
++	Total  int    `json:"total_tokens"`
++	Count  int    `json:"request_count"`
++	Stream int    `json:"stream_count"`
++}
++
++// ModelSummary 是某模型/账号的聚合展示。
++type ModelSummary struct {
++	Name   string `json:"name"`
++	Input  int    `json:"input_tokens"`
++	Output int    `json:"output_tokens"`
++	Total  int    `json:"total_tokens"`
++	Count  int    `json:"request_count"`
++}
++
++// Summary 返回聚合统计。rangeDays=0 表示全部，>0 表示最近 N 天（含今日）。
++func (s *Store) Summary(rangeDays int) Summary {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	now := time.Now().UTC()
++	todayKey := now.Format("2006-01-02")
++	out := Summary{Today: todayKey}
++
++	// 收集所有日期 key 并排序
++	allKeys := make([]string, 0, len(s.data.Days))
++	for k := range s.data.Days {
++		allKeys = append(allKeys, k)
++	}
++	sort.Strings(allKeys)
++
++	// 选定范围
++	var keys []string
++	if rangeDays > 0 && rangeDays < len(allKeys) {
++		keys = allKeys[len(allKeys)-rangeDays:]
++	} else {
++		keys = allKeys
++	}
++
++	// 今日
++	if d, ok := s.data.Days[todayKey]; ok {
++		out.TodayStats = DaySummary{
++			Date: todayKey, Input: d.Input, Output: d.Output,
++			Total: d.Total, Count: d.Count, Stream: d.Stream,
++		}
++	}
++
++	// 累计（全部日期）
++	var total DaySummary
++	for _, k := range allKeys {
++		d := s.data.Days[k]
++		total.Input += d.Input
++		total.Output += d.Output
++		total.Total += d.Total
++		total.Count += d.Count
++		total.Stream += d.Stream
++	}
++	total.Date = "all"
++	out.TotalStats = total
++
++	// 最近 7 天（含今日，不足则取全部）
++	last7Start := now.AddDate(0, 0, -6).Format("2006-01-02")
++	for _, k := range allKeys {
++		if k >= last7Start {
++			d := s.data.Days[k]
++			out.Last7Days = append(out.Last7Days, DaySummary{
++				Date: k, Input: d.Input, Output: d.Output,
++				Total: d.Total, Count: d.Count, Stream: d.Stream,
++			})
++		}
++	}
++
++	// 按模型/账号聚合（所选范围）
++	modelAgg := map[string]ModelSummary{}
++	accountAgg := map[string]ModelSummary{}
++	for _, k := range keys {
++		d := s.data.Days[k]
++		for name, m := range d.ByModel {
++			a := modelAgg[name]
++			a.Name = name
++			a.Input += m.Input
++			a.Output += m.Output
++			a.Total += m.Total
++			a.Count += m.Count
++			modelAgg[name] = a
++		}
++		for name, ac := range d.ByAccount {
++			a := accountAgg[name]
++			a.Name = name
++			a.Input += ac.Input
++			a.Output += ac.Output
++			a.Total += ac.Total
++			a.Count += ac.Count
++			accountAgg[name] = a
++		}
++	}
++	out.ByModel = toSortedSlice(modelAgg)
++	out.ByAccount = toSortedSlice(accountAgg)
++
++	return out
++}
++
++func toSortedSlice(m map[string]ModelSummary) []ModelSummary {
++	if len(m) == 0 {
++		return []ModelSummary{}
++	}
++	out := make([]ModelSummary, 0, len(m))
++	for _, v := range m {
++		out = append(out, v)
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].Total > out[j].Total })
++	return out
++}
+diff --git a/webui/src/features/usage/UsageStatisticsContainer.jsx b/webui/src/features/usage/UsageStatisticsContainer.jsx
+new file mode 100644
+index 0000000..c92622d
+--- /dev/null
++++ b/webui/src/features/usage/UsageStatisticsContainer.jsx
+@@ -0,0 +1,378 @@
++import { useCallback, useEffect, useState } from 'react'
++import {
++    BarChart3,
++    RefreshCw,
++    TrendingUp,
++    Users,
++    Activity,
++    Zap,
++    Download,
++} from 'lucide-react'
++import clsx from 'clsx'
++
++import { useI18n } from '../../i18n'
++
++// 统一响应解析（复刻自 ProxyManagerContainer 的 readApiResponse）
++async function readApiResponse(res, nonJsonMessage) {
++    const ct = res.headers.get('content-type') || ''
++    if (!ct.includes('application/json')) {
++        if (!res.ok) throw new Error(nonJsonMessage || `HTTP ${res.status}`)
++        return null
++    }
++    const data = await res.json()
++    if (!res.ok) {
++        const msg = data && (data.error || data.message)
++        throw new Error(msg || `HTTP ${res.status}`)
++    }
++    return data
++}
++
++// 数字格式化：1234567 → "1,234,567"
++function fmt(n) {
++    if (n == null || isNaN(n)) return '0'
++    return Number(n).toLocaleString('en-US')
++}
++
++// 日期格式化：2026-07-30 → "07-30"
++function fmtDate(d) {
++    if (!d) return ''
++    const parts = String(d).split('-')
++    return parts.length === 3 ? `${parts[1]}-${parts[2]}` : d
++}
++
++// 找最近 7 天数据里的最大值，用于柱状图高度归一化
++function maxTotal(days) {
++    if (!days || days.length === 0) return 1
++    let m = 0
++    for (const d of days) {
++        if (d.total_tokens > m) m = d.total_tokens
++    }
++    return m || 1
++}
++
++export default function UsageStatisticsContainer({ onMessage, authFetch }) {
++    const { t } = useI18n()
++    const [loading, setLoading] = useState(false)
++    const [summary, setSummary] = useState(null)
++    const [rangeDays, setRangeDays] = useState(7)
++    const [selectedDay, setSelectedDay] = useState(null)
++
++    const apiFetch = authFetch || fetch
++
++    const fetchUsage = useCallback(async () => {
++        setLoading(true)
++        try {
++            const res = await apiFetch(`/admin/usage?range_days=${rangeDays}`)
++            const data = await readApiResponse(res, t('usage.fetchFailed'))
++            setSummary(data)
++            // 默认选中今日
++            if (data && data.last_7_days && data.last_7_days.length > 0) {
++                const today = data.last_7_days[data.last_7_days.length - 1]
++                setSelectedDay(today)
++            }
++        } catch (err) {
++            if (onMessage) onMessage({ type: 'error', text: err.message || t('usage.fetchFailed') })
++        } finally {
++            setLoading(false)
++        }
++    }, [apiFetch, rangeDays, t, onMessage])
++
++    useEffect(() => {
++        fetchUsage()
++    }, [fetchUsage])
++
++    const handleRefresh = () => fetchUsage()
++
++    const handleExportCsv = () => {
++        if (!summary) return
++        const rows = [
++            ['date', 'input_tokens', 'output_tokens', 'total_tokens', 'request_count', 'stream_count'],
++        ]
++        if (summary.last_7_days) {
++            for (const d of summary.last_7_days) {
++                rows.push([d.date, d.input_tokens, d.output_tokens, d.total_tokens, d.request_count, d.stream_count])
++            }
++        }
++        const csv = rows.map(r => r.join(',')).join('\n')
++        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
++        const url = URL.createObjectURL(blob)
++        const a = document.createElement('a')
++        a.href = url
++        a.download = `usage_${new Date().toISOString().slice(0, 10)}.csv`
++        a.click()
++        URL.revokeObjectURL(url)
++    }
++
++    const stats = summary || {}
++    const today = stats.today_stats || { input_tokens: 0, output_tokens: 0, total_tokens: 0, request_count: 0, stream_count: 0 }
++    const total = stats.total_stats || { input_tokens: 0, output_tokens: 0, total_tokens: 0, request_count: 0, stream_count: 0 }
++    const last7 = stats.last_7_days || []
++    const byModel = stats.by_model || []
++    const byAccount = stats.by_account || []
++    const maxBar = maxTotal(last7)
++
++    return (
++        <div className="space-y-6">
++            {/* 页头 */}
++            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
++                <div>
++                    <h1 className="text-2xl lg:text-[1.75rem] font-semibold tracking-tight">{t('nav.usage.label')}</h1>
++                    <p className="mt-1 text-sm text-muted-foreground">{t('usage.pageDesc')}</p>
++                </div>
++                <div className="flex items-center gap-2">
++                    <select
++                        className="input-field h-9 w-auto text-sm"
++                        value={rangeDays}
++                        onChange={e => setRangeDays(Number(e.target.value))}
++                    >
++                        <option value={7}>{t('usage.range7')}</option>
++                        <option value={30}>{t('usage.range30')}</option>
++                        <option value={0}>{t('usage.rangeAll')}</option>
++                    </select>
++                    <button
++                        className="btn btn-secondary btn-sm"
++                        onClick={handleRefresh}
++                        disabled={loading}
++                    >
++                        <RefreshCw className={clsx('h-3.5 w-3.5', loading && 'animate-spin')} />
++                        <span className="hidden sm:inline">{t('usage.refresh')}</span>
++                    </button>
++                    <button
++                        className="btn btn-primary btn-sm"
++                        onClick={handleExportCsv}
++                    >
++                        <Download className="h-3.5 w-3.5" />
++                        <span className="hidden sm:inline">CSV</span>
++                    </button>
++                </div>
++            </div>
++
++            {/* 概览卡片 */}
++            <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
++                {/* 今日 token */}
++                <div className="bg-card border border-border rounded-xl p-5 shadow-sm">
++                    <div className="flex items-center gap-2 text-[10px] text-muted-foreground font-bold uppercase tracking-wider">
++                        <div className="h-7 w-7 rounded-lg bg-primary/10 flex items-center justify-center">
++                            <Zap className="h-3.5 w-3.5 text-primary" />
++                        </div>
++                        {t('usage.todayTokens')}
++                    </div>
++                    <div className="mt-2 text-2xl font-bold text-primary tabular-nums">{fmt(today.total_tokens)}</div>
++                    <div className="mt-1 text-xs text-muted-foreground">
++                        {t('usage.input')}: {fmt(today.input_tokens)} · {t('usage.output')}: {fmt(today.output_tokens)}
++                    </div>
++                </div>
++                {/* 累计总量 */}
++                <div className="bg-card border border-border rounded-xl p-5 shadow-sm">
++                    <div className="flex items-center gap-2 text-[10px] text-muted-foreground font-bold uppercase tracking-wider">
++                        <div className="h-7 w-7 rounded-lg bg-blue-500/10 flex items-center justify-center">
++                            <BarChart3 className="h-3.5 w-3.5 text-blue-500" />
++                        </div>
++                        {t('usage.totalTokens')}
++                    </div>
++                    <div className="mt-2 text-2xl font-bold tabular-nums">{fmt(total.total_tokens)}</div>
++                    <div className="mt-1 text-xs text-muted-foreground">{t('usage.sinceStart')}</div>
++                </div>
++                {/* 今日请求 */}
++                <div className="bg-card border border-border rounded-xl p-5 shadow-sm">
++                    <div className="flex items-center gap-2 text-[10px] text-muted-foreground font-bold uppercase tracking-wider">
++                        <div className="h-7 w-7 rounded-lg bg-emerald-500/10 flex items-center justify-center">
++                            <Activity className="h-3.5 w-3.5 text-emerald-500" />
++                        </div>
++                        {t('usage.todayRequests')}
++                    </div>
++                    <div className="mt-2 text-2xl font-bold text-emerald-500 tabular-nums">{fmt(today.request_count)}</div>
++                    <div className="mt-1 text-xs text-muted-foreground">
++                        {t('usage.stream')}: {fmt(today.stream_count)} · {t('usage.nonStream')}: {fmt(today.request_count - today.stream_count)}
++                    </div>
++                </div>
++                {/* 活跃账号数 */}
++                <div className="bg-card border border-border rounded-xl p-5 shadow-sm">
++                    <div className="flex items-center gap-2 text-[10px] text-muted-foreground font-bold uppercase tracking-wider">
++                        <div className="h-7 w-7 rounded-lg bg-purple-500/10 flex items-center justify-center">
++                            <Users className="h-3.5 w-3.5 text-purple-500" />
++                        </div>
++                        {t('usage.activeAccounts')}
++                    </div>
++                    <div className="mt-2 text-2xl font-bold text-purple-500 tabular-nums">{byAccount.length}</div>
++                    <div className="mt-1 text-xs text-muted-foreground">{t('usage.rangeAccounts')}</div>
++                </div>
++            </div>
++
++            {/* 7 日趋势图 */}
++            <div className="bg-card border border-border rounded-xl p-5 shadow-sm">
++                <div className="flex items-center justify-between mb-4">
++                    <div>
++                        <div className="text-sm font-semibold">{t('usage.trend7Title')}</div>
++                        <div className="mt-0.5 text-xs text-muted-foreground">{t('usage.trend7Desc')}</div>
++                    </div>
++                    <div className="flex gap-3 text-xs text-muted-foreground">
++                        <span className="flex items-center gap-1.5"><i className="inline-block h-2 w-2 rounded-full bg-primary" />{t('usage.total')}</span>
++                    </div>
++                </div>
++                {last7.length === 0 ? (
++                    <div className="py-12 text-center text-sm text-muted-foreground">{t('usage.noData')}</div>
++                ) : (
++                    <>
++                        <div className="flex items-end gap-1.5 h-48 pt-2">
++                            {last7.map((d, i) => {
++                                const heightPct = Math.max(4, (d.total_tokens / maxBar) * 100)
++                                const isToday = d.date === stats.today
++                                const isSelected = selectedDay && selectedDay.date === d.date
++                                return (
++                                    <button
++                                        key={d.date}
++                                        className={clsx(
++                                            'group relative flex-1 rounded-t-md transition-all duration-150 cursor-pointer',
++                                            'bg-gradient-to-t from-primary to-primary/40',
++                                            'hover:opacity-85 hover:-translate-y-0.5',
++                                            isSelected && 'ring-2 ring-primary ring-offset-2 ring-offset-card'
++                                        )}
++                                        style={{ height: `${heightPct}%`, minHeight: '4px' }}
++                                        onClick={() => setSelectedDay(d)}
++                                        title={`${d.date} · ${fmt(d.total_tokens)}`}
++                                    />
++                                )
++                            })}
++                        </div>
++                        <div className="flex justify-between mt-2 text-[10px] text-muted-foreground">
++                            {last7.map(d => (
++                                <span key={d.date}>{fmtDate(d.date)}</span>
++                            ))}
++                        </div>
++                        {/* 选中日期详情 */}
++                        {selectedDay && (
++                            <div className="mt-4 p-4 bg-muted/50 rounded-lg border border-border">
++                                <div className="flex items-center justify-between mb-3">
++                                    <span className="text-sm font-semibold">{selectedDay.date} {t('usage.detail')}</span>
++                                    <span className="text-[10px] text-muted-foreground">{t('usage.clickHint')}</span>
++                                </div>
++                                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
++                                    <div>
++                                        <div className="text-[10px] text-muted-foreground uppercase tracking-wider">{t('usage.input')}</div>
++                                        <div className="mt-0.5 text-lg font-semibold text-primary tabular-nums">{fmt(selectedDay.input_tokens)}</div>
++                                    </div>
++                                    <div>
++                                        <div className="text-[10px] text-muted-foreground uppercase tracking-wider">{t('usage.output')}</div>
++                                        <div className="mt-0.5 text-lg font-semibold text-blue-500 tabular-nums">{fmt(selectedDay.output_tokens)}</div>
++                                    </div>
++                                    <div>
++                                        <div className="text-[10px] text-muted-foreground uppercase tracking-wider">{t('usage.total')}</div>
++                                        <div className="mt-0.5 text-lg font-semibold tabular-nums">{fmt(selectedDay.total_tokens)}</div>
++                                    </div>
++                                    <div>
++                                        <div className="text-[10px] text-muted-foreground uppercase tracking-wider">{t('usage.todayRequests')}</div>
++                                        <div className="mt-0.5 text-lg font-semibold text-emerald-500 tabular-nums">{fmt(selectedDay.request_count)}</div>
++                                    </div>
++                                </div>
++                                <div className="mt-3 pt-3 border-t border-dashed border-border flex flex-wrap gap-6 text-xs text-muted-foreground">
++                                    <span>{t('usage.stream')}: <b className="text-foreground tabular-nums">{fmt(selectedDay.stream_count)}</b></span>
++                                    <span>{t('usage.nonStream')}: <b className="text-foreground tabular-nums">{fmt(selectedDay.request_count - selectedDay.stream_count)}</b></span>
++                                </div>
++                            </div>
++                        )}
++                    </>
++                )}
++            </div>
++
++            {/* 按模型统计 */}
++            <div className="bg-card border border-border rounded-xl shadow-sm overflow-hidden">
++                <div className="p-4 border-b border-border flex items-center justify-between">
++                    <div>
++                        <div className="text-sm font-semibold">{t('usage.byModel')}</div>
++                        <div className="mt-0.5 text-xs text-muted-foreground">{t('usage.byModelDesc')}</div>
++                    </div>
++                </div>
++                <div className="overflow-x-auto">
++                    <table className="w-full text-sm">
++                        <thead>
++                            <tr className="text-[10px] text-muted-foreground uppercase tracking-wider">
++                                <th className="text-left px-4 py-3 font-semibold">{t('usage.model')}</th>
++                                <th className="text-left px-4 py-3 font-semibold">{t('usage.requests')}</th>
++                                <th className="text-left px-4 py-3 font-semibold">{t('usage.input')}</th>
++                                <th className="text-left px-4 py-3 font-semibold">{t('usage.output')}</th>
++                                <th className="text-left px-4 py-3 font-semibold">{t('usage.total')}</th>
++                                <th className="text-left px-4 py-3 font-semibold hidden sm:table-cell">{t('usage.share')}</th>
++                            </tr>
++                        </thead>
++                        <tbody>
++                            {byModel.length === 0 ? (
++                                <tr><td colSpan={6} className="px-4 py-8 text-center text-sm text-muted-foreground">{t('usage.noData')}</td></tr>
++                            ) : byModel.map(m => {
++                                const maxTotal = byModel[0]?.total || 1
++                                const pct = maxTotal > 0 ? (m.total_tokens / maxTotal) * 100 : 0
++                                return (
++                                    <tr key={m.name} className="border-t border-border hover:bg-muted/50">
++                                        <td className="px-4 py-3">
++                                            <div className="flex items-center gap-2 font-medium">
++                                                <span className="inline-block h-2 w-2 rounded-full bg-primary" />
++                                                {m.name}
++                                            </div>
++                                        </td>
++                                        <td className="px-4 py-3 tabular-nums">{fmt(m.request_count)}</td>
++                                        <td className="px-4 py-3 tabular-nums">{fmt(m.input_tokens)}</td>
++                                        <td className="px-4 py-3 tabular-nums">{fmt(m.output_tokens)}</td>
++                                        <td className="px-4 py-3 tabular-nums font-semibold text-primary">{fmt(m.total_tokens)}</td>
++                                        <td className="px-4 py-3 hidden sm:table-cell">
++                                            <div className="w-40 h-1.5 bg-muted rounded-full overflow-hidden">
++                                                <div className="h-full bg-primary rounded-full" style={{ width: `${pct}%` }} />
++                                            </div>
++                                        </td>
++                                    </tr>
++                                )
++                            })}
++                        </tbody>
++                    </table>
++                </div>
++            </div>
++
++            {/* 按账号统计 */}
++            <div className="bg-card border border-border rounded-xl shadow-sm overflow-hidden">
++                <div className="p-4 border-b border-border">
++                    <div className="text-sm font-semibold">{t('usage.byAccount')}</div>
++                    <div className="mt-0.5 text-xs text-muted-foreground">{t('usage.byAccountDesc')}</div>
++                </div>
++                <div className="overflow-x-auto">
++                    <table className="w-full text-sm">
++                        <thead>
++                            <tr className="text-[10px] text-muted-foreground uppercase tracking-wider">
++                                <th className="text-left px-4 py-3 font-semibold">{t('usage.account')}</th>
++                                <th className="text-left px-4 py-3 font-semibold">{t('usage.requests')}</th>
++                                <th className="text-left px-4 py-3 font-semibold">{t('usage.total')}</th>
++                                <th className="text-left px-4 py-3 font-semibold hidden sm:table-cell">{t('usage.share')}</th>
++                            </tr>
++                        </thead>
++                        <tbody>
++                            {byAccount.length === 0 ? (
++                                <tr><td colSpan={4} className="px-4 py-8 text-center text-sm text-muted-foreground">{t('usage.noData')}</td></tr>
++                            ) : byAccount.map(a => {
++                                const maxTotal = byAccount[0]?.total || 1
++                                const pct = maxTotal > 0 ? (a.total_tokens / maxTotal) * 100 : 0
++                                return (
++                                    <tr key={a.name} className="border-t border-border hover:bg-muted/50">
++                                        <td className="px-4 py-3 font-medium">{a.name}</td>
++                                        <td className="px-4 py-3 tabular-nums">{fmt(a.request_count)}</td>
++                                        <td className="px-4 py-3 tabular-nums font-semibold text-primary">{fmt(a.total_tokens)}</td>
++                                        <td className="px-4 py-3 hidden sm:table-cell">
++                                            <div className="w-40 h-1.5 bg-muted rounded-full overflow-hidden">
++                                                <div className="h-full bg-primary rounded-full" style={{ width: `${pct}%` }} />
++                                            </div>
++                                        </td>
++                                    </tr>
++                                )
++                            })}
++                        </tbody>
++                    </table>
++                </div>
++            </div>
++
++            {/* 说明 */}
++            <div className="bg-card border border-border rounded-xl p-4 flex items-start gap-2.5 text-sm text-muted-foreground">
++                <TrendingUp className="h-4 w-4 flex-shrink-0 mt-0.5" />
++                <div>
++                    <strong className="text-foreground">{t('usage.note')}</strong>{t('usage.noteContent')}
++                </div>
++            </div>
++        </div>
++    )
++}
+diff --git a/webui/src/layout/DashboardShell.jsx b/webui/src/layout/DashboardShell.jsx
+index 4b04484..2198db5 100644
+--- a/webui/src/layout/DashboardShell.jsx
++++ b/webui/src/layout/DashboardShell.jsx
+@@ -14,6 +14,7 @@ import {
+     History,
+     Loader2,
+     ChevronRight,
++    BarChart3,
+ } from 'lucide-react'
+ import clsx from 'clsx'
+ 
+@@ -28,6 +29,7 @@ const BatchImport = lazy(() => import('../components/BatchImport'))
+ const VercelSyncContainer = lazy(() => import('../features/vercel/VercelSyncContainer'))
+ const SettingsContainer = lazy(() => import('../features/settings/SettingsContainer'))
+ const ProxyManagerContainer = lazy(() => import('../features/proxy/ProxyManagerContainer'))
++const UsageStatisticsContainer = lazy(() => import('../features/usage/UsageStatisticsContainer'))
+ 
+ function TabLoadingFallback({ label }) {
+     return (
+@@ -65,6 +67,7 @@ export default function DashboardShell({ token, onLogout, config, fetchConfig, s
+     const [sidebarOpen, setSidebarOpen] = useState(false)
+ 
+     const navItems = [
++        { id: 'usage', label: t('nav.usage.label'), icon: BarChart3, description: t('nav.usage.desc') },
+         { id: 'accounts', label: t('nav.accounts.label'), icon: Users, description: t('nav.accounts.desc') },
+         { id: 'proxies', label: t('nav.proxies.label'), icon: Globe, description: t('nav.proxies.desc') },
+         { id: 'test', label: t('nav.test.label'), icon: Server, description: t('nav.test.desc') },
+@@ -130,6 +133,8 @@ export default function DashboardShell({ token, onLogout, config, fetchConfig, s
+ 
+     const renderTab = () => {
+         switch (activeTab) {
++            case 'usage':
++                return <UsageStatisticsContainer onMessage={showMessage} authFetch={authFetch} />
+             case 'accounts':
+                 return <AccountManagerContainer config={config} onRefresh={fetchConfig} onMessage={showMessage} authFetch={authFetch} />
+             case 'proxies':
+diff --git a/webui/src/locales/en.json b/webui/src/locales/en.json
+index 32693cf..cb19a93 100644
+--- a/webui/src/locales/en.json
++++ b/webui/src/locales/en.json
+@@ -11,6 +11,10 @@
+         "switchToDark": "Switch to dark mode"
+     },
+     "nav": {
++        "usage": {
++            "label": "Usage Statistics",
++            "desc": "View token usage and request metrics"
++        },
+         "accounts": {
+             "label": "Account Management",
+             "desc": "Manage the DeepSeek account pool"
+@@ -544,5 +548,39 @@
+             "three": "Update the env var in Vercel:",
+             "four": "Trigger a redeploy to apply the updated environment variables."
+         }
++    },
++    "usage": {
++        "pageDesc": "Today's token usage, cumulative totals, breakdown by model and account",
++        "fetchFailed": "Failed to fetch usage statistics",
++        "range7": "Last 7 days",
++        "range30": "Last 30 days",
++        "rangeAll": "All time",
++        "refresh": "Refresh",
++        "todayTokens": "Today's Tokens",
++        "totalTokens": "Total Tokens",
++        "todayRequests": "Today's Requests",
++        "activeAccounts": "Active Accounts",
++        "rangeAccounts": "In selected range",
++        "sinceStart": "Cumulative since first request",
++        "input": "Input",
++        "output": "Output",
++        "total": "Total",
++        "stream": "Stream",
++        "nonStream": "Non-stream",
++        "trend7Title": "7-Day Token Usage Trend",
++        "trend7Desc": "Aggregated by day, click a bar for details",
++        "detail": "Usage Details",
++        "clickHint": "Click other bars to switch",
++        "byModel": "By Model",
++        "byModelDesc": "Token consumption and requests per model",
++        "byAccount": "By Account",
++        "byAccountDesc": "Token consumption and requests per account",
++        "model": "Model",
++        "account": "Account",
++        "requests": "Requests",
++        "share": "Share",
++        "noData": "No data",
++        "note": "Note: ",
++        "noteContent": "Usage data is based on token estimation (tiktoken encoding) after each request completes, stored independently from chat history and accumulated long-term. Only successful requests are counted; both stream and non-stream are included."
+     }
+ }
+diff --git a/webui/src/locales/zh.json b/webui/src/locales/zh.json
+index d44c256..e919e8c 100644
+--- a/webui/src/locales/zh.json
++++ b/webui/src/locales/zh.json
+@@ -11,6 +11,10 @@
+         "switchToDark": "切换到暗色模式"
+     },
+     "nav": {
++        "usage": {
++            "label": "用量统计",
++            "desc": "查看 token 用量与请求统计"
++        },
+         "accounts": {
+             "label": "账号管理",
+             "desc": "管理 DeepSeek 账号池"
+@@ -544,5 +548,39 @@
+             "three": "更新 Vercel 项目中的环境变量：",
+             "four": "触发重新部署以应用新的环境变量。"
+         }
++    },
++    "usage": {
++        "pageDesc": "今日 token 用量、累计总量、按模型与账号拆分",
++        "fetchFailed": "获取用量统计失败",
++        "range7": "最近 7 天",
++        "range30": "最近 30 天",
++        "rangeAll": "全部",
++        "refresh": "刷新",
++        "todayTokens": "今日 Token 用量",
++        "totalTokens": "累计 Token 总量",
++        "todayRequests": "今日请求数",
++        "activeAccounts": "活跃账号",
++        "rangeAccounts": "所选时间范围内",
++        "sinceStart": "自首次请求起累计",
++        "input": "输入",
++        "output": "输出",
++        "total": "总计",
++        "stream": "流式",
++        "nonStream": "非流式",
++        "trend7Title": "7 日 Token 用量趋势",
++        "trend7Desc": "按天聚合，点击柱状图查看详情",
++        "detail": "用量详情",
++        "clickHint": "点击其他柱可切换",
++        "byModel": "按模型统计",
++        "byModelDesc": "各模型 token 消耗与请求数",
++        "byAccount": "按账号统计",
++        "byAccountDesc": "各账号 token 消耗与请求分布",
++        "model": "模型",
++        "account": "账号",
++        "requests": "请求数",
++        "share": "占比",
++        "noData": "暂无数据",
++        "note": "说明：",
++        "noteContent": "用量数据基于每次请求完成后的 token 估算（tiktoken 编码），独立于聊天历史存储，长期累积不丢失。仅统计请求成功的记录；流式与非流式均包含。"
+     }
+ }
+-- 
+2.43.0
+
