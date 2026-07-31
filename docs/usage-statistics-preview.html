@@ -115,10 +115,32 @@
   .chart-legend span{display:flex;align-items:center;gap:.3125rem}
   .chart-legend i{width:.625rem;height:.625rem;border-radius:9999px;display:inline-block}
   .chart{height:200px;display:flex;align-items:flex-end;gap:3px;padding-top:.5rem;position:relative}
-  .chart-bar{flex:1;background:linear-gradient(to top, var(--color-primary), color-mix(in srgb, var(--color-primary) 40%, transparent));border-radius:3px 3px 0 0;min-height:4px;position:relative;transition:opacity .15s}
-  .chart-bar:hover{opacity:.8}
+  .chart-bar{flex:1;background:linear-gradient(to top, var(--color-primary), color-mix(in srgb, var(--color-primary) 40%, transparent));border-radius:3px 3px 0 0;min-height:4px;position:relative;transition:opacity .15s, transform .15s;cursor:pointer}
+  .chart-bar:hover{opacity:.85;transform:translateY(-2px)}
+  .chart-bar.selected{outline:2px solid var(--color-primary);outline-offset:2px;opacity:1}
   .chart-bar.alt{background:linear-gradient(to top, #3b82f6, #3b82f640)}
   .chart-x{display:flex;justify-content:space-between;font-size:.625rem;color:var(--color-muted-foreground);margin-top:.5rem}
+
+  /* 悬浮 tooltip */
+  .chart-tooltip{position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%);background:var(--color-popover);color:var(--color-popover-foreground);border:1px solid var(--color-border);border-radius:var(--radius);padding:.5rem .75rem;font-size:.75rem;white-space:nowrap;box-shadow:0 4px 12px #00000040;opacity:0;pointer-events:none;transition:opacity .15s;z-index:10}
+  .chart-bar:hover .chart-tooltip{opacity:1}
+  .chart-tooltip .tt-title{font-weight:600;margin-bottom:.25rem}
+  .chart-tooltip .tt-row{display:flex;justify-content:space-between;gap:1rem;line-height:1.4}
+  .chart-tooltip .tt-row .tt-k{color:var(--color-muted-foreground)}
+  .chart-tooltip .tt-row .tt-v{font-variant-numeric:tabular-nums;font-weight:500}
+  .chart-tooltip .tt-dot{display:inline-block;width:.5rem;height:.5rem;border-radius:9999px;margin-right:.3125rem;vertical-align:middle}
+
+  /* 点击展开的详情卡 */
+  .chart-detail{margin-top:1rem;padding:1rem 1.25rem;background:var(--color-muted);border-radius:var(--radius);border:1px solid var(--color-border);font-size:.8125rem;display:none}
+  .chart-detail.show{display:block}
+  .chart-detail-title{font-weight:600;margin-bottom:.625rem;display:flex;align-items:center;justify-content:space-between}
+  .chart-detail-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem}
+  @media(max-width:640px){.chart-detail-grid{grid-template-columns:repeat(2,1fr)}}
+  .chart-detail-item .k{font-size:.7rem;color:var(--color-muted-foreground);margin-bottom:.125rem}
+  .chart-detail-item .v{font-size:1rem;font-weight:600;font-variant-numeric:tabular-nums}
+  .chart-detail-breakdown{margin-top:.75rem;padding-top:.75rem;border-top:1px dashed var(--color-border);display:flex;gap:1.5rem;flex-wrap:wrap;font-size:.75rem}
+  .chart-detail-breakdown span{display:flex;align-items:center;gap:.3125rem;color:var(--color-muted-foreground)}
+  .chart-detail-breakdown b{color:var(--color-foreground);font-variant-numeric:tabular-nums}
 
   /* 模型用量表 */
   .model-card{padding:0;margin-bottom:1.5rem}
@@ -272,18 +294,93 @@
           <span><i style="background:#3b82f6"></i>输出 tokens</span>
         </div>
       </div>
-      <div class="chart">
-        <!-- 7 根柱（每根两层：输入在下、输出在上），高度按模拟数据 -->
-        <div class="chart-bar" style="height:45%" title="07-24 输入 620k"></div>
-        <div class="chart-bar" style="height:52%" title="07-25 输入 720k"></div>
-        <div class="chart-bar" style="height:38%" title="07-26 输入 530k"></div>
-        <div class="chart-bar" style="height:61%" title="07-27 输入 845k"></div>
-        <div class="chart-bar" style="height:48%" title="07-28 输入 668k"></div>
-        <div class="chart-bar" style="height:55%" title="07-29 输入 760k"></div>
-        <div class="chart-bar" style="height:68%;background:linear-gradient(to top, var(--color-primary), color-mix(in srgb, var(--color-primary) 40%, transparent))" title="今日 输入 812k"></div>
+      <div class="chart" id="tokenChart">
+        <!-- 7 根柱，每根带 tooltip + 点击展开详情。data-* 用于 JS 渲染详情卡 -->
+        <div class="chart-bar" style="height:45%" data-date="07-24（周三）" data-input="620,440" data-output="358,920" data-total="979,360" data-requests="241" data-stream="218" data-models="deepseek-chat:185,deepseek-reasoner:48,deepseek-vision:8">
+          <div class="chart-tooltip">
+            <div class="tt-title">07-24（周三）</div>
+            <div class="tt-row"><span class="tt-k"><i class="tt-dot" style="background:var(--color-primary)"></i>输入</span><span class="tt-v">620,440</span></div>
+            <div class="tt-row"><span class="tt-k"><i class="tt-dot" style="background:#3b82f6"></i>输出</span><span class="tt-v">358,920</span></div>
+            <div class="tt-row"><span class="tt-k">总计</span><span class="tt-v">979,360</span></div>
+            <div class="tt-row"><span class="tt-k">请求数</span><span class="tt-v">241</span></div>
+          </div>
+        </div>
+        <div class="chart-bar" style="height:52%" data-date="07-25（周四）" data-input="720,180" data-output="412,560" data-total="1,132,740" data-requests="289" data-stream="261" data-models="deepseek-chat:214,deepseek-reasoner:62,deepseek-vision:13">
+          <div class="chart-tooltip">
+            <div class="tt-title">07-25（周四）</div>
+            <div class="tt-row"><span class="tt-k"><i class="tt-dot" style="background:var(--color-primary)"></i>输入</span><span class="tt-v">720,180</span></div>
+            <div class="tt-row"><span class="tt-k"><i class="tt-dot" style="background:#3b82f6"></i>输出</span><span class="tt-v">412,560</span></div>
+            <div class="tt-row"><span class="tt-k">总计</span><span class="tt-v">1,132,740</span></div>
+            <div class="tt-row"><span class="tt-k">请求数</span><span class="tt-v">289</span></div>
+          </div>
+        </div>
+        <div class="chart-bar" style="height:38%" data-date="07-26（周五）" data-input="530,220" data-output="298,140" data-total="828,360" data-requests="198" data-stream="178" data-models="deepseek-chat:152,deepseek-reasoner:38,deepseek-vision:8">
+          <div class="chart-tooltip">
+            <div class="tt-title">07-26（周五）</div>
+            <div class="tt-row"><span class="tt-k"><i class="tt-dot" style="background:var(--color-primary)"></i>输入</span><span class="tt-v">530,220</span></div>
+            <div class="tt-row"><span class="tt-k"><i class="tt-dot" style="background:#3b82f6"></i>输出</span><span class="tt-v">298,140</span></div>
+            <div class="tt-row"><span class="tt-k">总计</span><span class="tt-v">828,360</span></div>
+            <div class="tt-row"><span class="tt-k">请求数</span><span class="tt-v">198</span></div>
+          </div>
+        </div>
+        <div class="chart-bar" style="height:61%" data-date="07-27（周六）" data-input="845,300" data-output="492,180" data-total="1,337,480" data-requests="324" data-stream="295" data-models="deepseek-chat:241,deepseek-reasoner:68,deepseek-vision:15">
+          <div class="chart-tooltip">
+            <div class="tt-title">07-27（周六）</div>
+            <div class="tt-row"><span class="tt-k"><i class="tt-dot" style="background:var(--color-primary)"></i>输入</span><span class="tt-v">845,300</span></div>
+            <div class="tt-row"><span class="tt-k"><i class="tt-dot" style="background:#3b82f6"></i>输出</span><span class="tt-v">492,180</span></div>
+            <div class="tt-row"><span class="tt-k">总计</span><span class="tt-v">1,337,480</span></div>
+            <div class="tt-row"><span class="tt-k">请求数</span><span class="tt-v">324</span></div>
+          </div>
+        </div>
+        <div class="chart-bar" style="height:48%" data-date="07-28（周日）" data-input="668,750" data-output="384,920" data-total="1,053,670" data-requests="265" data-stream="238" data-models="deepseek-chat:198,deepseek-reasoner:55,deepseek-vision:12">
+          <div class="chart-tooltip">
+            <div class="tt-title">07-28（周日）</div>
+            <div class="tt-row"><span class="tt-k"><i class="tt-dot" style="background:var(--color-primary)"></i>输入</span><span class="tt-v">668,750</span></div>
+            <div class="tt-row"><span class="tt-k"><i class="tt-dot" style="background:#3b82f6"></i>输出</span><span class="tt-v">384,920</span></div>
+            <div class="tt-row"><span class="tt-k">总计</span><span class="tt-v">1,053,670</span></div>
+            <div class="tt-row"><span class="tt-k">请求数</span><span class="tt-v">265</span></div>
+          </div>
+        </div>
+        <div class="chart-bar" style="height:55%" data-date="07-29（周一）" data-input="760,440" data-output="421,180" data-total="1,181,620" data-requests="298" data-stream="272" data-models="deepseek-chat:222,deepseek-reasoner:60,deepseek-vision:16">
+          <div class="chart-tooltip">
+            <div class="tt-title">07-29（周一）</div>
+            <div class="tt-row"><span class="tt-k"><i class="tt-dot" style="background:var(--color-primary)"></i>输入</span><span class="tt-v">760,440</span></div>
+            <div class="tt-row"><span class="tt-k"><i class="tt-dot" style="background:#3b82f6"></i>输出</span><span class="tt-v">421,180</span></div>
+            <div class="tt-row"><span class="tt-k">总计</span><span class="tt-v">1,181,620</span></div>
+            <div class="tt-row"><span class="tt-k">请求数</span><span class="tt-v">298</span></div>
+          </div>
+        </div>
+        <div class="chart-bar selected" style="height:68%" data-date="今日（07-30）" data-input="812,340" data-output="472,166" data-total="1,284,506" data-requests="342" data-stream="298" data-models="deepseek-chat:218,deepseek-reasoner:98,deepseek-vision:26">
+          <div class="chart-tooltip">
+            <div class="tt-title">今日（07-30）</div>
+            <div class="tt-row"><span class="tt-k"><i class="tt-dot" style="background:var(--color-primary)"></i>输入</span><span class="tt-v">812,340</span></div>
+            <div class="tt-row"><span class="tt-k"><i class="tt-dot" style="background:#3b82f6"></i>输出</span><span class="tt-v">472,166</span></div>
+            <div class="tt-row"><span class="tt-k">总计</span><span class="tt-v">1,284,506</span></div>
+            <div class="tt-row"><span class="tt-k">请求数</span><span class="tt-v">342</span></div>
+          </div>
+        </div>
       </div>
       <div class="chart-x">
         <span>07-24</span><span>07-25</span><span>07-26</span><span>07-27</span><span>07-28</span><span>07-29</span><span>今日</span>
+      </div>
+
+      <!-- 点击柱状图展开的详情卡（默认显示"今日"，因为今日柱预选中） -->
+      <div class="chart-detail show" id="chartDetail">
+        <div class="chart-detail-title">
+          <span id="detailDate">今日（07-30）用量详情</span>
+          <span style="font-size:.7rem;color:var(--color-muted-foreground);font-weight:400">点击其他柱可切换</span>
+        </div>
+        <div class="chart-detail-grid">
+          <div class="chart-detail-item"><div class="k">输入 tokens</div><div class="v text-primary" id="detailInput">812,340</div></div>
+          <div class="chart-detail-item"><div class="k">输出 tokens</div><div class="v text-blue-500" id="detailOutput">472,166</div></div>
+          <div class="chart-detail-item"><div class="k">总 tokens</div><div class="v" id="detailTotal">1,284,506</div></div>
+          <div class="chart-detail-item"><div class="k">请求数</div><div class="v text-emerald-500" id="detailRequests">342</div></div>
+        </div>
+        <div class="chart-detail-breakdown">
+          <span>流式请求 <b id="detailStream">298</b></span>
+          <span>非流式请求 <b id="detailNonStream">44</b></span>
+          <span>模型分布 <b id="detailModels">chat 218 · reasoner 98 · vision 26</b></span>
+        </div>
       </div>
     </div>
 
@@ -426,6 +523,37 @@
     const html=document.documentElement;
     html.setAttribute('data-theme', html.getAttribute('data-theme')==='light'?'dark':'light');
   }
+
+  // 柱状图点击交互：切换 selected 状态，更新下方详情卡
+  const bars=document.querySelectorAll('#tokenChart .chart-bar');
+  const modelLabels={ 'deepseek-chat':'chat', 'deepseek-reasoner':'reasoner', 'deepseek-vision':'vision' };
+  const modelColors={ 'deepseek-chat':'var(--color-primary)', 'deepseek-reasoner':'#3b82f6', 'deepseek-vision':'#10b981' };
+  bars.forEach(bar=>{
+    bar.addEventListener('click', ()=>{
+      bars.forEach(b=>b.classList.remove('selected'));
+      bar.classList.add('selected');
+      const date=bar.dataset.date;
+      const input=bar.dataset.input;
+      const output=bar.dataset.output;
+      const total=bar.dataset.total;
+      const reqs=parseInt(bar.dataset.requests,10);
+      const stream=parseInt(bar.dataset.stream,10);
+      const nonStream=reqs-stream;
+      // 模型分布格式化：deepseek-chat:218,deepseek-reasoner:98,deepseek-vision:26 → chat 218 · reasoner 98 · vision 26
+      const modelsTxt=bar.dataset.models.split(',')
+        .map(m=>{const [n,c]=m.split(':');return `${modelLabels[n]||n} ${c}`;})
+        .join(' · ');
+      document.getElementById('detailDate').textContent=`${date} 用量详情`;
+      document.getElementById('detailInput').textContent=input;
+      document.getElementById('detailOutput').textContent=output;
+      document.getElementById('detailTotal').textContent=total;
+      document.getElementById('detailRequests').textContent=reqs;
+      document.getElementById('detailStream').textContent=stream;
+      document.getElementById('detailNonStream').textContent=nonStream;
+      document.getElementById('detailModels').textContent=modelsTxt;
+      document.getElementById('chartDetail').classList.add('show');
+    });
+  });
 </script>
 </body>
 </html>
