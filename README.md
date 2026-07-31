@@ -161,6 +161,7 @@ git push origin v4.6.1-mihomo-vision-fix15
 
 | 本仓库 | 上游 ds2api | 说明 |
 |--------|-------------|------|
+| 4.6.1-mihomo-vision-fix18 | v4.6.1 + main 分支（b2dae335，含视觉路由） | 修复用量统计：按本地时区按日重置、7 日趋势补零并滚动刷新、今日活跃账号计数 |
 | 4.6.1-mihomo-vision-fix17 | v4.6.1 + main 分支（b2dae335，含视觉路由） | 新增 token 用量统计功能（独立存储 + 多维聚合 + webui 页面） |
 | 4.6.1-mihomo-vision-fix16 | v4.6.1 + main 分支（b2dae335，含视觉路由） | 同步上游内核（账户停用检测、专家模式文件拆分） |
 | 4.6.1-mihomo-vision-fix15 | v4.6.1 + main 分支（含视觉路由） | 两阶段启动、主/备用节点顺位、失效节点自动恢复、端口冲突修复 |

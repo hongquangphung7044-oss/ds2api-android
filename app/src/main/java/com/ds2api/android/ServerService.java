@@ -204,6 +204,10 @@ public class ServerService extends Service {
             env.put("DS2API_STATIC_ADMIN_DIR", staticDir.getAbsolutePath());
             env.put("DS2API_AUTO_BUILD_WEBUI", "0");
             env.put("DS2API_ADMIN_KEY", adminKey(this));
+            // 用量统计按日聚合使用的时区：传设备本地时区，确保"今日"边界与
+            // 用户本地日历一致（避免 UTC 日界导致凌晨请求记到昨天、每日不重置）。
+            // Go 侧已嵌入 time/tzdata，可解析标准 IANA ID（如 Asia/Shanghai）。
+            env.put("DS2API_USAGE_TZ", java.util.TimeZone.getDefault().getID());
 
             LogStore.get().log("APP", "工作目录: " + filesDir.getAbsolutePath());
             LogStore.get().log("APP", "配置文件: " + configFile.getAbsolutePath());

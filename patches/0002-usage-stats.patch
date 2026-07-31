@@ -11,12 +11,12 @@ Subject: [PATCH] feat: add usage statistics (token usage tracking + webui
  internal/httpapi/admin/usage/handler_usage.go |  37 ++
  internal/httpapi/admin/usage/routes.go        |   8 +
  internal/server/router.go                     |   8 +-
- internal/usagestats/usagestats.go             | 358 +++++++++++++++++
+ internal/usagestats/usagestats.go             | 392 +++++++++++++++++
  .../usage/UsageStatisticsContainer.jsx        | 378 ++++++++++++++++++
  webui/src/layout/DashboardShell.jsx           |   5 +
  webui/src/locales/en.json                     |  38 ++
  webui/src/locales/zh.json                     |  38 ++
- 11 files changed, 881 insertions(+), 1 deletion(-)
+ 11 files changed, 915 insertions(+), 1 deletion(-)
  create mode 100644 internal/httpapi/admin/usage/deps.go
  create mode 100644 internal/httpapi/admin/usage/handler_usage.go
  create mode 100644 internal/httpapi/admin/usage/routes.go
@@ -193,7 +193,7 @@ new file mode 100644
 index 0000000..c406f7c
 --- /dev/null
 +++ b/internal/usagestats/usagestats.go
-@@ -0,0 +1,358 @@
+@@ -0,0 +1,392 @@
 +// Package usagestats 提供独立于 chat-history 的 token 用量统计存储。
 +//
 +// 设计目标：
@@ -216,16 +216,36 @@ index 0000000..c406f7c
 +	"sort"
 +	"sync"
 +	"time"
++
++	// 嵌入 tzdata：Android 交叉编译二进制可能找不到系统时区库，
++	// 导致 time.Local 解析为 UTC。blank import 保证 LoadLocation 可用。
++	_ "time/tzdata"
 +)
 +
 +// Stats 存储 usage 统计的全局单例。在 router.go 初始化时设置。
 +var Stats = New(resolveDataDir())
 +
-+// Record 代表单次请求的归一化 usage（内部用，不导出）。
++// statsLoc 是按日聚合使用的时区。
++// 优先级：DS2API_USAGE_TZ 环境变量 > time.Local > UTC。
++// 关键：必须用用户本地时区，否则 UTC 日的边界（北京 08:00）会让
++// 凌晨请求记到"昨天"，导致"今日用量不重置""7 日趋势不更新"。
++var statsLoc = resolveStatsLoc()
 +
-+// dailyKey 形如 "2026-07-30"（UTC），用于按日聚合。
++func resolveStatsLoc() *time.Location {
++	if tz := os.Getenv("DS2API_USAGE_TZ"); tz != "" {
++		if loc, err := time.LoadLocation(tz); err == nil {
++			return loc
++		}
++	}
++	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
++		return loc // 默认中国时区（主要用户群），有 tzdata 兜底一定能加载
++	}
++	return time.UTC
++}
++
++// dailyKey 形如 "2026-07-30"（用户本地时区），用于按日聚合。
 +func dailyKey(ts int64) string {
-+	return time.UnixMilli(ts).UTC().Format("2006-01-02")
++	return time.UnixMilli(ts).In(statsLoc).Format("2006-01-02")
 +}
 +
 +// modelDayAgg 是某模型在某日的聚合值。
@@ -427,12 +447,13 @@ index 0000000..c406f7c
 +
 +// Summary 是 /admin/usage 返回的聚合结果。
 +type Summary struct {
-+	Today      string         `json:"today"`       // 今日日期 key（UTC）
-+	TodayStats DaySummary     `json:"today_stats"` // 今日汇总
-+	TotalStats DaySummary     `json:"total_stats"` // 全部累计
-+	Last7Days  []DaySummary   `json:"last_7_days"` // 最近 7 天（含今日，按日期升序）
-+	ByModel    []ModelSummary `json:"by_model"`    // 按模型汇总（所选范围）
-+	ByAccount  []ModelSummary `json:"by_account"`  // 按账号汇总（所选范围）
++	Today                string         `json:"today"`                  // 今日日期 key（本地时区）
++	TodayStats           DaySummary     `json:"today_stats"`            // 今日汇总
++	TodayActiveAccounts  int            `json:"today_active_accounts"`  // 今日活跃账号数（与其它"今日"卡片口径一致）
++	TotalStats           DaySummary     `json:"total_stats"`            // 全部累计
++	Last7Days            []DaySummary   `json:"last_7_days"`            // 最近 7 天（始终 7 个柱，含今日，按日期升序，缺失补零）
++	ByModel              []ModelSummary `json:"by_model"`               // 按模型汇总（所选范围）
++	ByAccount            []ModelSummary `json:"by_account"`             // 按账号汇总（所选范围）
 +}
 +
 +// DaySummary 是某日的聚合展示。
@@ -459,7 +480,10 @@ index 0000000..c406f7c
 +	s.mu.Lock()
 +	defer s.mu.Unlock()
 +
-+	now := time.Now().UTC()
++	// 关键：用 statsLoc（用户本地时区）计算"今日"和滚动窗口边界，
++	// 与 Record 写入时的 dailyKey 口径一致。若用 UTC，北京 00:00-08:00
++	// 的请求会落进 UTC 的"昨天"，导致"今日用量不重置""7 日趋势不更新"。
++	now := time.Now().In(statsLoc)
 +	todayKey := now.Format("2006-01-02")
 +	out := Summary{Today: todayKey}
 +
@@ -470,20 +494,13 @@ index 0000000..c406f7c
 +	}
 +	sort.Strings(allKeys)
 +
-+	// 选定范围
-+	var keys []string
-+	if rangeDays > 0 && rangeDays < len(allKeys) {
-+		keys = allKeys[len(allKeys)-rangeDays:]
-+	} else {
-+		keys = allKeys
-+	}
-+
-+	// 今日
++	// 今日（含今日活跃账号数，与其它"今日"卡片口径一致）
 +	if d, ok := s.data.Days[todayKey]; ok {
 +		out.TodayStats = DaySummary{
 +			Date: todayKey, Input: d.Input, Output: d.Output,
 +			Total: d.Total, Count: d.Count, Stream: d.Stream,
 +		}
++		out.TodayActiveAccounts = len(d.ByAccount)
 +	}
 +
 +	// 累计（全部日期）
@@ -499,16 +516,33 @@ index 0000000..c406f7c
 +	total.Date = "all"
 +	out.TotalStats = total
 +
-+	// 最近 7 天（含今日，不足则取全部）
-+	last7Start := now.AddDate(0, 0, -6).Format("2006-01-02")
-+	for _, k := range allKeys {
-+		if k >= last7Start {
-+			d := s.data.Days[k]
-+			out.Last7Days = append(out.Last7Days, DaySummary{
-+				Date: k, Input: d.Input, Output: d.Output,
-+				Total: d.Total, Count: d.Count, Stream: d.Stream,
-+			})
++	// 最近 7 天：以"今日"为右端点的滚动 7 日窗口（含今日）。
++	// 按本地时区日历逐日生成，缺失日期补零，确保始终 7 个柱；
++	// 下一个自然日到来后 now 滚动，窗口自动刷新（不会卡在固定日期）。
++	for i := 6; i >= 0; i-- {
++		dayKey := now.AddDate(0, 0, -i).Format("2006-01-02")
++		ds := DaySummary{Date: dayKey}
++		if d, ok := s.data.Days[dayKey]; ok {
++			ds.Input = d.Input
++			ds.Output = d.Output
++			ds.Total = d.Total
++			ds.Count = d.Count
++			ds.Stream = d.Stream
 +		}
++		out.Last7Days = append(out.Last7Days, ds)
++	}
++
++	// 选定范围用于按模型/账号聚合：按日历取最近 rangeDays 天（0=全部）
++	var keys []string
++	if rangeDays > 0 {
++		start := now.AddDate(0, 0, -(rangeDays - 1)).Format("2006-01-02")
++		for _, k := range allKeys {
++			if k >= start {
++				keys = append(keys, k)
++			}
++		}
++	} else {
++		keys = allKeys
 +	}
 +
 +	// 按模型/账号聚合（所选范围）
@@ -754,8 +788,8 @@ index 0000000..c92622d
 +                        </div>
 +                        {t('usage.activeAccounts')}
 +                    </div>
-+                    <div className="mt-2 text-2xl font-bold text-purple-500 tabular-nums">{byAccount.length}</div>
-+                    <div className="mt-1 text-xs text-muted-foreground">{t('usage.rangeAccounts')}</div>
++                    <div className="mt-2 text-2xl font-bold text-purple-500 tabular-nums">{fmt(stats.today_active_accounts || 0)}</div>
++                    <div className="mt-1 text-xs text-muted-foreground">{t('usage.todayActiveAccounts')}</div>
 +                </div>
 +            </div>
 +
@@ -1004,7 +1038,7 @@ index 32693cf..cb19a93 100644
 +        "totalTokens": "Total Tokens",
 +        "todayRequests": "Today's Requests",
 +        "activeAccounts": "Active Accounts",
-+        "rangeAccounts": "In selected range",
++        "todayActiveAccounts": "Today active",
 +        "sinceStart": "Cumulative since first request",
 +        "input": "Input",
 +        "output": "Output",
@@ -1059,7 +1093,7 @@ index d44c256..e919e8c 100644
 +        "totalTokens": "累计 Token 总量",
 +        "todayRequests": "今日请求数",
 +        "activeAccounts": "活跃账号",
-+        "rangeAccounts": "所选时间范围内",
++        "todayActiveAccounts": "今日活跃账号",
 +        "sinceStart": "自首次请求起累计",
 +        "input": "输入",
 +        "output": "输出",
